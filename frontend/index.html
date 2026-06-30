@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>pdf2epub</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --surface2: #22263a;
+      --accent: #6c63ff;
+      --accent-hover: #5549e0;
+      --text: #e8eaf0;
+      --muted: #888ca0;
+      --border: #2e3150;
+      --success: #43d9a0;
+      --error: #ff5c6c;
+      --warn: #ffc95c;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+    }
+
+    h1 {
+      font-size: 2rem;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      margin-bottom: 0.25rem;
+    }
+    h1 span { color: var(--accent); }
+
+    .subtitle {
+      color: var(--muted);
+      font-size: 0.95rem;
+      margin-bottom: 2rem;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 2rem;
+      width: 100%;
+      max-width: 800px;
+      margin-bottom: 1.5rem;
+    }
+
+    /* Model status pill */
+    #model-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 12px;
+      border-radius: 999px;
+      font-size: 0.8rem;
+      font-weight: 500;
+      margin-bottom: 1.5rem;
+      border: 1px solid var(--border);
+      background: var(--surface2);
+    }
+    #model-badge .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--warn);
+    }
+    #model-badge.ready .dot { background: var(--success); }
+    #model-badge.error .dot { background: var(--error); }
+
+    /* Drop zone */
+    #drop-zone {
+      border: 2px dashed var(--border);
+      border-radius: 10px;
+      padding: 3rem 2rem;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color 0.2s, background 0.2s;
+      background: var(--surface2);
+    }
+    #drop-zone:hover, #drop-zone.drag-over {
+      border-color: var(--accent);
+      background: rgba(108, 99, 255, 0.07);
+    }
+    #drop-zone svg { color: var(--muted); margin-bottom: 0.75rem; }
+    #drop-zone p { color: var(--muted); font-size: 0.95rem; }
+    #drop-zone p strong { color: var(--text); }
+    #file-input { display: none; }
+
+    /* Thumbnails */
+    #thumb-section { display: none; }
+    #thumb-section h2 { font-size: 1rem; color: var(--muted); margin-bottom: 1rem; font-weight: 500; }
+
+    #thumb-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+      gap: 10px;
+      max-height: 420px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+
+    .thumb-item {
+      border: 2px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      cursor: pointer;
+      position: relative;
+      transition: border-color 0.15s, transform 0.1s;
+      background: var(--surface2);
+    }
+    .thumb-item:hover { border-color: var(--accent); transform: scale(1.02); }
+    .thumb-item.selected { border-color: var(--accent); }
+    .thumb-item.selected::after {
+      content: '✓ Cover';
+      position: absolute;
+      bottom: 0; left: 0; right: 0;
+      background: var(--accent);
+      color: #fff;
+      text-align: center;
+      font-size: 0.7rem;
+      font-weight: 600;
+      padding: 3px 0;
+    }
+    .thumb-item img { display: block; width: 100%; }
+    .thumb-item .page-num {
+      position: absolute;
+      top: 4px; left: 4px;
+      background: rgba(0,0,0,0.55);
+      color: #fff;
+      font-size: 0.65rem;
+      padding: 2px 5px;
+      border-radius: 4px;
+    }
+
+    /* Options */
+    label { font-size: 0.85rem; color: var(--muted); display: block; margin-bottom: 0.3rem; }
+    input[type="text"] {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 0.55rem 0.75rem;
+      border-radius: 7px;
+      font-size: 0.95rem;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input[type="text"]:focus { border-color: var(--accent); }
+
+    .cover-note {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-top: 0.4rem;
+    }
+
+    /* Button */
+    button#convert-btn {
+      width: 100%;
+      padding: 0.85rem;
+      background: var(--accent);
+      color: #fff;
+      font-size: 1rem;
+      font-weight: 600;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: background 0.2s, opacity 0.2s;
+    }
+    button#convert-btn:hover:not(:disabled) { background: var(--accent-hover); }
+    button#convert-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    /* Progress */
+    #progress-section { display: none; }
+    #progress-section h2 { font-size: 1rem; color: var(--muted); margin-bottom: 1rem; font-weight: 500; }
+
+    .progress-bar-wrap {
+      background: var(--surface2);
+      border-radius: 999px;
+      height: 6px;
+      overflow: hidden;
+      margin-bottom: 0.75rem;
+    }
+    .progress-bar {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 999px;
+      transition: width 0.4s ease;
+    }
+    #step-text { font-size: 0.88rem; color: var(--muted); min-height: 1.2em; }
+
+    /* Result */
+    #result-section { display: none; }
+    .result-box {
+      border-radius: 10px;
+      padding: 1.2rem 1.5rem;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+    .result-box.success { background: rgba(67, 217, 160, 0.1); border: 1px solid rgba(67,217,160,0.3); }
+    .result-box.error   { background: rgba(255, 92, 108, 0.1); border: 1px solid rgba(255,92,108,0.3); }
+    .result-box .icon { font-size: 1.8rem; }
+    .result-box .message { font-size: 0.95rem; }
+    .result-box .file-path { font-size: 0.8rem; color: var(--muted); margin-top: 4px; font-family: monospace; }
+
+    button#reset-btn {
+      margin-top: 1rem;
+      padding: 0.5rem 1.2rem;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 7px;
+      cursor: pointer;
+      font-size: 0.9rem;
+      transition: border-color 0.2s;
+    }
+    button#reset-btn:hover { border-color: var(--accent); }
+
+    .divider { height: 1px; background: var(--border); margin: 1.5rem 0; }
+    .form-group { margin-bottom: 1rem; }
+  </style>
+</head>
+<body>
+
+  <h1>pdf<span>2</span>epub</h1>
+  <p class="subtitle">OCR-powered PDF to EPUB converter using Unlimited-OCR</p>
+
+  <div id="model-badge">
+    <span class="dot"></span>
+    <span id="model-status-text">Model loading…</span>
+  </div>
+
+  <!-- Upload card -->
+  <div class="card" id="upload-card">
+    <div id="drop-zone" role="button" tabindex="0" aria-label="Upload PDF">
+      <svg width="40" height="40" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+        <path stroke-linecap="round" stroke-linejoin="round"
+          d="M12 16V4m0 0L8 8m4-4l4 4M4 20h16" />
+      </svg>
+      <p><strong>Drop a PDF here</strong> or click to browse</p>
+      <p style="margin-top:0.3rem; font-size:0.8rem;">Max 500 MB</p>
+    </div>
+    <input type="file" id="file-input" accept=".pdf" />
+  </div>
+
+  <!-- Thumbnails + options card -->
+  <div class="card" id="thumb-section">
+    <h2 id="thumb-title">Select a cover page <span style="font-weight:400">(optional)</span></h2>
+    <div id="thumb-grid"></div>
+    <p class="cover-note" id="cover-note">Click a page to use it as the EPUB cover. Click again to deselect.</p>
+
+    <div class="divider"></div>
+
+    <div class="form-group">
+      <label for="output-name">Output filename (without extension)</label>
+      <input type="text" id="output-name" placeholder="e.g. my-document" />
+    </div>
+
+    <button id="convert-btn" disabled>Convert to EPUB</button>
+  </div>
+
+  <!-- Progress card -->
+  <div class="card" id="progress-section">
+    <h2>Converting…</h2>
+    <div class="progress-bar-wrap">
+      <div class="progress-bar" id="progress-bar" style="width: 5%"></div>
+    </div>
+    <p id="step-text">Starting…</p>
+  </div>
+
+  <!-- Result card -->
+  <div class="card" id="result-section"></div>
+
+<script>
+(function () {
+  // ── State ──────────────────────────────────────────────────────────────
+  let jobId = null;
+  let pageCount = 0;
+  let selectedCoverPage = null;
+  let pollInterval = null;
+  let progressValue = 5;
+
+  // ── Elements ────────────────────────────────────────────────────────────
+  const dropZone      = document.getElementById('drop-zone');
+  const fileInput     = document.getElementById('file-input');
+  const thumbSection  = document.getElementById('thumb-section');
+  const thumbGrid     = document.getElementById('thumb-grid');
+  const thumbTitle    = document.getElementById('thumb-title');
+  const coverNote     = document.getElementById('cover-note');
+  const outputName    = document.getElementById('output-name');
+  const convertBtn    = document.getElementById('convert-btn');
+  const progressSec   = document.getElementById('progress-section');
+  const progressBar   = document.getElementById('progress-bar');
+  const stepText      = document.getElementById('step-text');
+  const resultSec     = document.getElementById('result-section');
+  const modelBadge    = document.getElementById('model-badge');
+  const modelText     = document.getElementById('model-status-text');
+
+  // ── Model status polling ────────────────────────────────────────────────
+  async function pollModelStatus() {
+    try {
+      const r = await fetch('/api/model-status');
+      const data = await r.json();
+      if (data.status === 'ready') {
+        modelBadge.classList.add('ready');
+        modelText.textContent = 'Model ready';
+        updateConvertBtn();
+        clearInterval(modelPoll);
+      } else if (data.status === 'error') {
+        modelBadge.classList.add('error');
+        modelText.textContent = 'Model error: ' + data.detail;
+        clearInterval(modelPoll);
+      } else {
+        modelText.textContent = 'Model loading…';
+      }
+    } catch (e) {
+      modelText.textContent = 'Backend unreachable';
+    }
+  }
+
+  const modelPoll = setInterval(pollModelStatus, 3000);
+  pollModelStatus();
+
+  function isModelReady() {
+    return modelBadge.classList.contains('ready');
+  }
+
+  // ── Drop zone ──────────────────────────────────────────────────────────
+  dropZone.addEventListener('click', () => fileInput.click());
+  dropZone.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') fileInput.click(); });
+
+  dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+  dropZone.addEventListener('dragleave',  () => dropZone.classList.remove('drag-over'));
+  dropZone.addEventListener('drop', e => {
+    e.preventDefault();
+    dropZone.classList.remove('drag-over');
+    const file = e.dataTransfer.files[0];
+    if (file) handleFile(file);
+  });
+
+  fileInput.addEventListener('change', () => {
+    if (fileInput.files[0]) handleFile(fileInput.files[0]);
+  });
+
+  // ── Upload ─────────────────────────────────────────────────────────────
+  async function handleFile(file) {
+    if (!file.name.toLowerCase().endsWith('.pdf')) {
+      alert('Please select a PDF file.');
+      return;
+    }
+
+    dropZone.innerHTML = `<p>Uploading <strong>${escHtml(file.name)}</strong>…</p>`;
+
+    const form = new FormData();
+    form.append('file', file);
+
+    let data;
+    try {
+      const r = await fetch('/api/upload', { method: 'POST', body: form });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({ detail: r.statusText }));
+        throw new Error(err.detail || r.statusText);
+      }
+      data = await r.json();
+    } catch (e) {
+      dropZone.innerHTML = `<p style="color:var(--error)">Upload failed: ${escHtml(e.message)}</p>`;
+      return;
+    }
+
+    jobId = data.job_id;
+    pageCount = data.page_count;
+
+    // Pre-fill output name from filename
+    outputName.value = data.filename.replace(/\.pdf$/i, '');
+
+    dropZone.innerHTML = `<p>✓ <strong>${escHtml(data.filename)}</strong> — ${pageCount} page${pageCount !== 1 ? 's' : ''}</p>`;
+
+    await loadThumbnails();
+  }
+
+  // ── Thumbnails ─────────────────────────────────────────────────────────
+  async function loadThumbnails() {
+    thumbGrid.innerHTML = '';
+    selectedCoverPage = null;
+
+    thumbSection.style.display = 'block';
+    thumbTitle.innerHTML = `Select a cover page <span style="font-weight:400">(optional — click a page)</span>`;
+
+    for (let i = 0; i < pageCount; i++) {
+      const item = document.createElement('div');
+      item.className = 'thumb-item';
+      item.dataset.page = i;
+
+      const numBadge = document.createElement('span');
+      numBadge.className = 'page-num';
+      numBadge.textContent = `p.${i + 1}`;
+
+      const img = document.createElement('img');
+      img.src = `/api/thumbnail/${jobId}/${i}`;
+      img.alt = `Page ${i + 1}`;
+      img.loading = 'lazy';
+
+      item.appendChild(numBadge);
+      item.appendChild(img);
+      item.addEventListener('click', () => selectCover(i));
+      thumbGrid.appendChild(item);
+    }
+
+    updateConvertBtn();
+  }
+
+  function selectCover(page) {
+    const items = thumbGrid.querySelectorAll('.thumb-item');
+    if (selectedCoverPage === page) {
+      // Deselect
+      selectedCoverPage = null;
+      items[page].classList.remove('selected');
+      coverNote.textContent = 'Click a page to use it as the EPUB cover. Click again to deselect.';
+    } else {
+      if (selectedCoverPage !== null) items[selectedCoverPage].classList.remove('selected');
+      selectedCoverPage = page;
+      items[page].classList.add('selected');
+      coverNote.textContent = `Page ${page + 1} selected as cover.`;
+    }
+  }
+
+  function updateConvertBtn() {
+    convertBtn.disabled = !(jobId && isModelReady());
+  }
+
+  // ── Convert ────────────────────────────────────────────────────────────
+  convertBtn.addEventListener('click', async () => {
+    if (!jobId) return;
+
+    thumbSection.style.display  = 'none';
+    document.getElementById('upload-card').style.display = 'none';
+    progressSec.style.display   = 'block';
+    progressValue = 5;
+    setProgress(5, 'Submitting job…');
+
+    const body = {
+      job_id: jobId,
+      cover_page: selectedCoverPage,
+      output_filename: outputName.value.trim() || null,
+    };
+
+    try {
+      const r = await fetch('/api/process', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({ detail: r.statusText }));
+        throw new Error(err.detail || r.statusText);
+      }
+    } catch (e) {
+      showError(e.message);
+      return;
+    }
+
+    pollInterval = setInterval(pollStatus, 2500);
+  });
+
+  // ── Poll status ────────────────────────────────────────────────────────
+  async function pollStatus() {
+    let data;
+    try {
+      const r = await fetch(`/api/status/${jobId}`);
+      data = await r.json();
+    } catch (e) {
+      return; // transient network error — keep polling
+    }
+
+    // Advance fake progress bar while processing
+    if (data.status === 'processing') {
+      progressValue = Math.min(progressValue + 2, 90);
+      setProgress(progressValue, data.step || 'Processing…');
+    }
+
+    if (data.status === 'done') {
+      clearInterval(pollInterval);
+      setProgress(100, 'Done!');
+      setTimeout(() => showSuccess(data.output_file), 400);
+    }
+
+    if (data.status === 'error') {
+      clearInterval(pollInterval);
+      showError(data.error || 'An unknown error occurred.');
+    }
+  }
+
+  function setProgress(pct, msg) {
+    progressBar.style.width = pct + '%';
+    stepText.textContent = msg;
+  }
+
+  // ── Result views ───────────────────────────────────────────────────────
+  function showSuccess(filename) {
+    progressSec.style.display = 'none';
+    resultSec.style.display   = 'block';
+    resultSec.innerHTML = `
+      <div class="result-box success">
+        <div class="icon">📖</div>
+        <div>
+          <div class="message">Conversion complete!</div>
+          <div class="file-path">${escHtml(filename)}</div>
+        </div>
+      </div>
+      <button id="reset-btn">Convert another PDF</button>
+    `;
+    document.getElementById('reset-btn').addEventListener('click', resetUI);
+  }
+
+  function showError(msg) {
+    progressSec.style.display = 'none';
+    resultSec.style.display   = 'block';
+    resultSec.innerHTML = `
+      <div class="result-box error">
+        <div class="icon">⚠️</div>
+        <div>
+          <div class="message">Conversion failed</div>
+          <div class="file-path">${escHtml(msg)}</div>
+        </div>
+      </div>
+      <button id="reset-btn">Try again</button>
+    `;
+    document.getElementById('reset-btn').addEventListener('click', resetUI);
+  }
+
+  function resetUI() {
+    jobId = null;
+    pageCount = 0;
+    selectedCoverPage = null;
+    clearInterval(pollInterval);
+
+    document.getElementById('upload-card').style.display = 'block';
+    dropZone.innerHTML = `
+      <svg width="40" height="40" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M12 16V4m0 0L8 8m4-4l4 4M4 20h16" />
+      </svg>
+      <p><strong>Drop a PDF here</strong> or click to browse</p>
+      <p style="margin-top:0.3rem; font-size:0.8rem;">Max 500 MB</p>
+    `;
+    fileInput.value = '';
+    thumbGrid.innerHTML = '';
+    thumbSection.style.display  = 'none';
+    progressSec.style.display   = 'none';
+    resultSec.style.display     = 'none';
+    resultSec.innerHTML         = '';
+    outputName.value            = '';
+    updateConvertBtn();
+  }
+
+  function escHtml(s) {
+    return String(s)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+})();
+</script>
+</body>
+</html>
