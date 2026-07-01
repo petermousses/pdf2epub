@@ -4,6 +4,13 @@ Model is loaded once at startup and reused across requests.
 """
 
 import os
+
+# Must be set before torch initializes the CUDA allocator. expandable_segments
+# lets PyTorch grow allocations without leaving fragmented, unusable gaps, which
+# is what pushes us over the edge on a shared/near-full GPU.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import gc
 import glob
 import tempfile
 import threading
@@ -18,11 +25,94 @@ logger = logging.getLogger(__name__)
 
 MODEL_NAME = "baidu/Unlimited-OCR"
 
+# Pages are OCR'd in batches so peak memory does not scale with page count.
+# A 491-page PDF pushed a single infer_multi call to ~12 GB RSS and got the
+# process OOM-killed by the kernel; batching bounds that regardless of size.
+OCR_BATCH_SIZE = int(os.environ.get("OCR_BATCH_SIZE", "8"))
+
+# Only try to (re)claim the GPU when at least this much VRAM is free, so we
+# don't thrash a ~6 GB model on/off the card when Ollama is using it.
+MIN_GPU_FREE_BYTES = int(os.environ.get("OCR_MIN_GPU_FREE_GB", "7")) * 1024**3
+
 _model = None
 _tokenizer = None
+_model_device = "cpu"
 _model_lock = threading.Lock()
 _model_ready = threading.Event()
 _model_error: Optional[str] = None
+
+
+def _is_oom(exc: Exception) -> bool:
+    """True if the exception is a CUDA out-of-memory condition."""
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    return "out of memory" in str(exc).lower()
+
+
+def _place_on_gpu() -> bool:
+    """
+    Try to move the loaded model onto the GPU.
+    Returns True if it now lives on the GPU, False if it stayed on the CPU
+    (e.g. because the GPU was full — typically Ollama holding VRAM).
+    """
+    global _model, _model_device
+
+    if not torch.cuda.is_available():
+        _model_device = "cpu"
+        logger.warning("CUDA not available — running OCR on CPU (expect slow performance)")
+        return False
+
+    try:
+        torch.cuda.empty_cache()
+        _model = _model.cuda()
+        torch.cuda.empty_cache()
+        _model_device = "cuda"
+        logger.info("Model placed on GPU: %s", torch.cuda.get_device_name(0))
+        return True
+    except Exception as e:
+        if not _is_oom(e):
+            raise
+        # GPU is full (e.g. an Ollama model is loaded). Fall back to CPU rather
+        # than crashing; free whatever partial allocation we made first.
+        _model = _model.cpu()
+        torch.cuda.empty_cache()
+        _model_device = "cpu"
+        logger.warning(
+            "GPU out of memory while placing OCR model — falling back to CPU. "
+            "Free VRAM (e.g. unload Ollama models) for faster OCR."
+        )
+        return False
+
+
+def _maybe_promote_to_gpu():
+    """
+    If the model is on the CPU but the GPU now has enough free VRAM (e.g. an
+    Ollama model was unloaded), move it back to the GPU. No-op otherwise.
+    """
+    global _model, _model_device
+
+    if _model_device == "cuda" or not torch.cuda.is_available():
+        return
+
+    try:
+        free, _total = torch.cuda.mem_get_info()
+    except Exception:
+        return
+    if free < MIN_GPU_FREE_BYTES:
+        return
+
+    try:
+        torch.cuda.empty_cache()
+        _model = _model.cuda()
+        torch.cuda.empty_cache()
+        _model_device = "cuda"
+        logger.info("VRAM free again (%.1f GiB) — moved OCR model back to GPU.", free / 1024**3)
+    except Exception as e:
+        if not _is_oom(e):
+            raise
+        _model = _model.cpu()
+        torch.cuda.empty_cache()
+        _model_device = "cpu"
 
 
 def load_model():
@@ -34,24 +124,28 @@ def load_model():
         from transformers import AutoModel, AutoTokenizer
 
         _tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+        # low_cpu_mem_usage streams weights in rather than materializing a second
+        # full copy, keeping the load-time memory peak down.
         _model = AutoModel.from_pretrained(
             MODEL_NAME,
             trust_remote_code=True,
             use_safetensors=True,
             torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
         )
-
-        if torch.cuda.is_available():
-            _model = _model.eval().cuda()
-            logger.info("Model loaded on GPU: %s", torch.cuda.get_device_name(0))
-        else:
-            _model = _model.eval()
-            logger.warning("CUDA not available — running on CPU (expect slow performance)")
+        _model = _model.eval()
+        _place_on_gpu()
 
         _model_ready.set()
-        logger.info("Unlimited-OCR model ready.")
+        logger.info("Unlimited-OCR model ready (device=%s).", _model_device)
     except Exception as e:
         _model_error = str(e)
+        # Drop the partially-placed model and free its GPU allocation so a
+        # subsequent retry isn't starved by leaked memory.
+        _model = None
+        _tokenizer = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         _model_ready.set()  # unblock waiters so they can surface the error
         logger.exception("Failed to load model: %s", e)
 
@@ -79,7 +173,7 @@ def get_model_status() -> dict:
     if _model_error:
         return {"status": "error", "detail": _model_error}
     if _model_ready.is_set():
-        return {"status": "ready"}
+        return {"status": "ready", "device": _model_device}
     return {"status": "loading"}
 
 
@@ -161,17 +255,12 @@ def run_ocr(image_paths: list[str], progress_callback=None) -> str:
     """
     wait_for_model()
 
-    with _model_lock:
-        tmp_out = tempfile.mkdtemp(prefix="ocr_output_")
-
-        if progress_callback:
-            progress_callback("Running OCR on all pages...")
-
-        result = _model.infer_multi(
+    def _infer(batch: list[str], out_dir: str):
+        return _model.infer_multi(
             _tokenizer,
             prompt="<image>Multi page parsing.",
-            image_files=image_paths,
-            output_path=tmp_out,
+            image_files=batch,
+            output_path=out_dir,
             image_size=1024,
             max_length=32768,
             no_repeat_ngram_size=35,
@@ -179,15 +268,63 @@ def run_ocr(image_paths: list[str], progress_callback=None) -> str:
             save_results=True,
         )
 
-        # Try to get text from return value first
-        text = None
+    def _extract_text(result, out_dir: str) -> str:
+        # Prefer the return value, fall back to reading saved output files.
         if isinstance(result, str) and result.strip():
-            text = result
-        elif isinstance(result, (list, tuple)):
-            text = "\n\n".join(str(r) for r in result if r)
+            return result
+        if isinstance(result, (list, tuple)):
+            joined = "\n\n".join(str(r) for r in result if r)
+            if joined.strip():
+                return joined
+        return _collect_ocr_output(out_dir)
 
-        # Fall back to reading saved output files
-        if not text:
-            text = _collect_ocr_output(tmp_out)
+    with _model_lock:
+        global _model, _model_device
 
-        return text or ""
+        # Process in batches so peak memory stays bounded regardless of how many
+        # pages the PDF has.
+        batches = [
+            image_paths[i : i + OCR_BATCH_SIZE]
+            for i in range(0, len(image_paths), OCR_BATCH_SIZE)
+        ]
+        texts: list[str] = []
+
+        for bi, batch in enumerate(batches):
+            # Reclaim the GPU between batches if VRAM has freed up (e.g. Ollama
+            # unloaded a model). Cheap no-op when already on GPU or still full.
+            _maybe_promote_to_gpu()
+
+            if progress_callback:
+                start = bi * OCR_BATCH_SIZE + 1
+                end = start + len(batch) - 1
+                progress_callback(
+                    f"OCR pages {start}–{end} of {len(image_paths)} "
+                    f"(on {_model_device.upper()})..."
+                )
+
+            tmp_out = tempfile.mkdtemp(prefix="ocr_output_")
+            try:
+                result = _infer(batch, tmp_out)
+            except Exception as e:
+                # GPU filled up mid-run (e.g. Ollama grabbed VRAM). Drop to CPU
+                # and retry this batch rather than failing the whole job.
+                if not (_is_oom(e) and _model_device == "cuda"):
+                    raise
+                logger.warning("GPU OOM during OCR — moving model to CPU and retrying batch.")
+                if progress_callback:
+                    progress_callback("GPU busy — switching to CPU (slower)...")
+                _model = _model.cpu()
+                torch.cuda.empty_cache()
+                _model_device = "cpu"
+                tmp_out = tempfile.mkdtemp(prefix="ocr_output_")
+                result = _infer(batch, tmp_out)
+
+            texts.append(_extract_text(result, tmp_out))
+
+            # Free per-batch memory before moving on.
+            del result
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        return "\n\n".join(t for t in texts if t).strip()

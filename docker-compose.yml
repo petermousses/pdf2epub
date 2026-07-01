@@ -6,6 +6,8 @@ services:
     environment:
       - OUTPUT_DIR=${OUTPUT_DIR:-/output}
       - HF_HOME=/hf_cache
+      # Reduce CUDA memory fragmentation so the model fits on a shared/near-full GPU.
+      - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     volumes:
       - ${OUTPUT_DIR:-./output}:/output
       - hf_cache:/hf_cache
