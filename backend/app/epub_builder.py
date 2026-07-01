@@ -98,8 +98,11 @@ th, td { border: 1px solid #ccc; padding: 0.4em 0.8em; }
             file_name=f"chapter_{idx + 1:03d}.xhtml",
             lang="en",
         )
+        # NOTE: do NOT prepend an <?xml ...?> prolog here. ebooklib emits its own
+        # XML declaration on write, and a leading prolog makes its
+        # get_body_content() parser return an empty body, which later crashes the
+        # page-break scan with lxml "Document is empty".
         chapter.content = (
-            f"<?xml version='1.0' encoding='UTF-8'?>"
             f"<html xmlns='http://www.w3.org/1999/xhtml'>"
             f"<head><title>{chapter_title}</title>"
             f"<link rel='stylesheet' type='text/css' href='style/main.css'/>"

@@ -281,13 +281,12 @@ def run_ocr(image_paths: list[str], progress_callback=None) -> str:
         )
 
     def _extract_text(result, out_dir: str) -> str:
-        # Prefer the return value, fall back to reading saved output files.
+        # infer_multi returns (markdown_text, output_token_count); take the text.
+        if isinstance(result, (list, tuple)):
+            result = result[0] if result else None
         if isinstance(result, str) and result.strip():
             return result
-        if isinstance(result, (list, tuple)):
-            joined = "\n\n".join(str(r) for r in result if r)
-            if joined.strip():
-                return joined
+        # Fall back to reading saved output files (result.md).
         return _collect_ocr_output(out_dir)
 
     with _model_lock:
