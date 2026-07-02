@@ -1,6 +1,12 @@
 services:
   backend:
+    container_name: ${PROJECT_SUB_DOMAIN:-pdf2epub}-backend
     build: ./backend
+    restart: unless-stopped
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "8000:8000"
     environment:
@@ -23,13 +29,38 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
 
   frontend:
+    container_name: ${PROJECT_SUB_DOMAIN:-pdf2epub}
     build: ./frontend
+    restart: unless-stopped
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "3001:80"
     depends_on:
       - backend
+    networks:
+      - default
+      - proxy
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
+      - traefik.enable=true
+      - traefik.http.routers.${PROJECT_SUB_DOMAIN:-pdf2epub}.entrypoints=websecure
+      - traefik.http.routers.${PROJECT_SUB_DOMAIN:-pdf2epub}.rule=Host(`${PROJECT_SUB_DOMAIN:-pdf2epub}.${LOCAL_DOMAIN_NAME:-example.com}`)
+      - homepage.group=Personal
+      - homepage.name=pdf2epub
+      - homepage.icon=mdi-file-pdf-box
+      - homepage.href=https://${PROJECT_SUB_DOMAIN:-pdf2epub}.${LOCAL_DOMAIN_NAME:-example.com}
+      - homepage.description=Convert PDFs to EPUB with OCR
 
 volumes:
   hf_cache:
+
+networks:
+  proxy:
+    external: true
