@@ -4,7 +4,11 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - OUTPUT_DIR=${OUTPUT_DIR:-/output}
+      # Path *inside the container* the app writes EPUBs to. This must be the
+      # mount target below (/output), NOT the host path in .env — otherwise a
+      # relative host OUTPUT_DIR (e.g. ./output) makes the app write to
+      # /app/output, outside the volume, and the files never reach the host.
+      - OUTPUT_DIR=/output
       - HF_HOME=/hf_cache
       # Reduce CUDA memory fragmentation so the model fits on a shared/near-full GPU.
       - PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
