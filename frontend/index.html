@@ -228,6 +228,47 @@
 
     .divider { height: 1px; background: var(--border); margin: 1.5rem 0; }
     .form-group { margin-bottom: 1rem; }
+
+    /* Library */
+    #library-card h2 {
+      font-size: 1rem; color: var(--muted); margin-bottom: 1rem; font-weight: 500;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    #library-refresh { cursor: pointer; color: var(--accent); font-size: 0.8rem; font-weight: 400; }
+    .lib-empty { color: var(--muted); font-size: 0.85rem; }
+    .lib-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 0.7rem 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .lib-row:last-child { border-bottom: none; }
+    .lib-info { min-width: 0; flex: 1; }
+    .lib-name { font-size: 0.9rem; word-break: break-all; }
+    .lib-meta { font-size: 0.75rem; color: var(--muted); margin-top: 2px; }
+    .lib-status { font-size: 0.78rem; margin-top: 6px; }
+    .lib-status.ok { color: var(--success); }
+    .lib-status.bad { color: var(--error); }
+    .lib-issues {
+      font-size: 0.72rem; color: var(--muted); margin-top: 4px;
+      font-family: monospace; white-space: pre-wrap;
+    }
+    .lib-actions { display: flex; gap: 0.5rem; flex-shrink: 0; }
+    .lib-btn {
+      padding: 0.35rem 0.7rem;
+      font-size: 0.8rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .lib-btn:hover:not(:disabled) { border-color: var(--accent); }
+    .lib-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .lib-btn.fix { background: var(--accent); border-color: var(--accent); color: #fff; }
   </style>
 </head>
 <body>
@@ -251,6 +292,12 @@
       <p style="margin-top:0.3rem; font-size:0.8rem;">Max 500 MB</p>
     </div>
     <input type="file" id="file-input" accept=".pdf" />
+  </div>
+
+  <!-- Library card -->
+  <div class="card" id="library-card">
+    <h2>Existing EPUBs <span id="library-refresh">↻ refresh</span></h2>
+    <div id="library-list"></div>
   </div>
 
   <!-- Thumbnails + options card -->
@@ -520,6 +567,7 @@
       <button id="reset-btn">Convert another PDF</button>
     `;
     document.getElementById('reset-btn').addEventListener('click', resetUI);
+    loadLibrary();
   }
 
   function showError(msg) {
@@ -567,6 +615,124 @@
       .replace(/&/g,'&amp;').replace(/</g,'&lt;')
       .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
+
+  // ── Library (validate/fix existing EPUBs) ─────────────────────────────
+  const libraryList    = document.getElementById('library-list');
+  const libraryRefresh = document.getElementById('library-refresh');
+
+  async function loadLibrary() {
+    libraryList.innerHTML = '<p class="lib-empty">Loading…</p>';
+    try {
+      const r = await fetch('/api/library');
+      const data = await r.json();
+      renderLibrary(data.files || []);
+    } catch (e) {
+      libraryList.innerHTML = `<p class="lib-empty">Could not load library: ${escHtml(e.message)}</p>`;
+    }
+  }
+
+  function formatSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  }
+
+  function renderLibrary(files) {
+    if (!files.length) {
+      libraryList.innerHTML = '<p class="lib-empty">No EPUBs in the output directory yet.</p>';
+      return;
+    }
+    libraryList.innerHTML = '';
+    for (const f of files) {
+      const row = document.createElement('div');
+      row.className = 'lib-row';
+      row.innerHTML = `
+        <div class="lib-info">
+          <div class="lib-name">${escHtml(f.filename)}</div>
+          <div class="lib-meta">${formatSize(f.size)}</div>
+          <div class="lib-status" data-role="status"></div>
+          <div class="lib-issues" data-role="issues"></div>
+        </div>
+        <div class="lib-actions">
+          <button class="lib-btn" data-role="validate">Validate</button>
+          <button class="lib-btn fix" data-role="fix" disabled>Fix</button>
+        </div>
+      `;
+      const statusEl    = row.querySelector('[data-role="status"]');
+      const issuesEl     = row.querySelector('[data-role="issues"]');
+      const validateBtn = row.querySelector('[data-role="validate"]');
+      const fixBtn      = row.querySelector('[data-role="fix"]');
+
+      validateBtn.addEventListener('click', () => runValidate(f.filename, statusEl, issuesEl, fixBtn, validateBtn));
+      fixBtn.addEventListener('click', () => runFix(f.filename, statusEl, issuesEl, fixBtn, validateBtn));
+
+      libraryList.appendChild(row);
+    }
+  }
+
+  async function runValidate(filename, statusEl, issuesEl, fixBtn, validateBtn) {
+    validateBtn.disabled = true;
+    statusEl.className = 'lib-status';
+    statusEl.textContent = 'Checking…';
+    issuesEl.textContent = '';
+    try {
+      const r = await fetch(`/api/library/${encodeURIComponent(filename)}/validate`, { method: 'POST' });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+      const data = await r.json();
+      if (data.valid) {
+        statusEl.className = 'lib-status ok';
+        statusEl.textContent = '✓ Valid';
+        fixBtn.disabled = true;
+      } else {
+        statusEl.className = 'lib-status bad';
+        statusEl.textContent = `⚠ ${data.issues.length} issue${data.issues.length !== 1 ? 's' : ''} found`;
+        issuesEl.textContent = data.issues.join('\n');
+        fixBtn.disabled = false;
+      }
+    } catch (e) {
+      statusEl.className = 'lib-status bad';
+      statusEl.textContent = 'Validation failed: ' + e.message;
+    } finally {
+      validateBtn.disabled = false;
+    }
+  }
+
+  async function runFix(filename, statusEl, issuesEl, fixBtn, validateBtn) {
+    fixBtn.disabled = true;
+    statusEl.className = 'lib-status';
+    statusEl.textContent = 'Fixing…';
+    try {
+      const r = await fetch(`/api/library/${encodeURIComponent(filename)}/fix`, { method: 'POST' });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).detail || r.statusText);
+      const data = await r.json();
+      const remaining = data.issues_after || [];
+      const unfixable = data.unfixable || [];
+      const notes = [...remaining, ...unfixable];
+
+      if (!data.changed) {
+        statusEl.className = remaining.length ? 'lib-status bad' : 'lib-status ok';
+        statusEl.textContent = remaining.length
+          ? `⚠ No automatic fix available`
+          : '✓ Valid';
+      } else if (!remaining.length) {
+        statusEl.className = 'lib-status ok';
+        statusEl.textContent = `✓ Fixed${data.backup ? ` — original saved as ${data.backup}` : ''}`;
+        fixBtn.disabled = true;
+      } else {
+        statusEl.className = 'lib-status bad';
+        statusEl.textContent = `⚠ Partially fixed — ${remaining.length} issue${remaining.length !== 1 ? 's' : ''} remain${data.backup ? ` (original saved as ${data.backup})` : ''}`;
+      }
+      issuesEl.textContent = notes.join('\n');
+    } catch (e) {
+      statusEl.className = 'lib-status bad';
+      statusEl.textContent = 'Fix failed: ' + e.message;
+    } finally {
+      validateBtn.disabled = false;
+    }
+  }
+
+  libraryRefresh.addEventListener('click', loadLibrary);
+  loadLibrary();
 })();
 </script>
 </body>

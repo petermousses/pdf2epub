@@ -7,6 +7,9 @@ Endpoints:
   POST /api/process        Start OCR + EPUB conversion
   GET  /api/status/{job_id}           Poll job status
   GET  /api/model-status   Check model loading status
+  GET  /api/library                   List EPUBs in the output directory
+  POST /api/library/{filename}/validate  Check an existing EPUB for problems
+  POST /api/library/{filename}/fix       Attempt to repair a broken EPUB
 """
 
 import os
@@ -35,7 +38,7 @@ from .ocr import (
     get_model_status,
     is_model_ready,
 )
-from .epub_builder import build_epub
+from .epub_builder import build_epub, validate_epub_report, repair_epub
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -269,3 +272,42 @@ async def status(job_id: str):
 @app.get("/api/model-status")
 async def model_status():
     return get_model_status()
+
+
+# ── Library (validate/fix existing output EPUBs) ─────────────────────────────
+
+def _library_path(filename: str) -> Path:
+    # Path(filename).name strips any directory components, so a mismatch
+    # against the original means path traversal (e.g. "../../etc/passwd")
+    # was attempted.
+    safe_name = Path(filename).name
+    if not safe_name or safe_name != filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    path = OUTPUT_DIR / safe_name
+    if path.suffix.lower() != ".epub" or not path.is_file():
+        raise HTTPException(status_code=404, detail="EPUB not found")
+    return path
+
+
+@app.get("/api/library")
+async def list_library():
+    files = []
+    for p in sorted(OUTPUT_DIR.glob("*.epub")):
+        st = p.stat()
+        files.append({"filename": p.name, "size": st.st_size, "modified": st.st_mtime})
+    return {"files": files}
+
+
+@app.post("/api/library/{filename}/validate")
+async def validate_library_epub(filename: str):
+    path = _library_path(filename)
+    issues = validate_epub_report(str(path))
+    return {"filename": path.name, "valid": not issues, "issues": issues}
+
+
+@app.post("/api/library/{filename}/fix")
+async def fix_library_epub(filename: str):
+    path = _library_path(filename)
+    result = repair_epub(str(path))
+    return {"filename": path.name, **result}

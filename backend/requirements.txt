@@ -12,6 +12,7 @@ psutil>=5.9.0
 ebooklib>=0.18
 markdown>=3.6
 lxml>=5.0
+html5lib>=1.1
 huggingface_hub>=0.24.0
 accelerate>=0.34.0
 safetensors>=0.4.0

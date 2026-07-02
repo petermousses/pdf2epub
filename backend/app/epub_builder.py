@@ -4,15 +4,19 @@ Build an EPUB from OCR-extracted markdown text and an optional cover image.
 
 import html
 import io
+import os
 import re
+import shutil
 import uuid
 import logging
+import warnings
 import zipfile
 from pathlib import Path
 
 import markdown
 import lxml.html as lhtml
 from lxml import etree
+from lxml.html import html5parser
 from ebooklib import epub
 from PIL import Image, UnidentifiedImageError
 
@@ -113,38 +117,272 @@ def _prepare_cover(image_bytes: bytes) -> tuple[bytes, str, str] | None:
     return buf.getvalue(), "cover.jpg", "image/jpeg"
 
 
-def _validate_epub(output_path: str) -> None:
+def _collect_issues(path: str) -> list[str]:
     """
-    Sanity-check the EPUB actually written to disk before declaring success,
-    rather than letting a corrupt file reach the user's reader silently.
+    Hard structural problems in an EPUB: corrupt archive, missing mimetype,
+    content documents that aren't well-formed XML, or images that don't
+    decode. Shared by the build-time validator and the library validate/fix
+    endpoints. Raises zipfile.BadZipFile/OSError if the file can't be opened
+    as a zip at all — callers decide how to report that.
     """
-    with zipfile.ZipFile(output_path) as zf:
+    issues = []
+    with zipfile.ZipFile(path) as zf:
         bad = zf.testzip()
         if bad is not None:
-            raise RuntimeError(f"EPUB archive is corrupt at member: {bad}")
+            issues.append(f"Archive is corrupt at member: {bad}")
+            return issues
 
         names = zf.namelist()
         if "mimetype" not in names:
-            raise RuntimeError("EPUB is missing the required 'mimetype' entry")
+            issues.append("Missing required 'mimetype' entry")
 
         for name in names:
-            if name.endswith((".xhtml", ".html", ".ncx", ".opf")) or name.endswith(
-                "nav.xhtml"
-            ):
+            if name.endswith((".xhtml", ".html", ".ncx", ".opf")):
                 try:
                     etree.fromstring(zf.read(name))
                 except etree.XMLSyntaxError as e:
-                    raise RuntimeError(
-                        f"EPUB validation failed: {name} is not well-formed XML ({e})"
-                    ) from e
+                    issues.append(f"{name}: not well-formed XML ({e})")
             elif name.endswith((".jpg", ".jpeg", ".png")):
                 try:
                     img = Image.open(io.BytesIO(zf.read(name)))
                     img.load()
                 except (UnidentifiedImageError, OSError) as e:
-                    raise RuntimeError(
-                        f"EPUB validation failed: image {name} is not decodable ({e})"
-                    ) from e
+                    issues.append(f"{name}: image is not decodable ({e})")
+    return issues
+
+
+def _validate_epub(output_path: str) -> None:
+    """
+    Sanity-check the EPUB actually written to disk before declaring success,
+    rather than letting a corrupt file reach the user's reader silently.
+    """
+    try:
+        issues = _collect_issues(output_path)
+    except (zipfile.BadZipFile, OSError) as e:
+        raise RuntimeError(f"EPUB archive could not be opened: {e}") from e
+    if issues:
+        raise RuntimeError("EPUB validation failed: " + "; ".join(issues))
+
+
+def _find_cover_href(opf_bytes: bytes) -> str | None:
+    """Locate the cover image's manifest href from an EPUB's OPF (epub3 or epub2 style)."""
+    tree = etree.fromstring(opf_bytes)
+    ns = {"opf": "http://www.idpf.org/2007/opf"}
+
+    for item in tree.findall(".//opf:manifest/opf:item", ns):
+        if "cover-image" in (item.get("properties") or "").split():
+            return item.get("href")
+
+    cover_id = None
+    for meta in tree.findall(".//opf:metadata/opf:meta", ns):
+        if meta.get("name") == "cover":
+            cover_id = meta.get("content")
+            break
+    if cover_id:
+        for item in tree.findall(".//opf:manifest/opf:item", ns):
+            if item.get("id") == cover_id:
+                return item.get("href")
+    return None
+
+
+def _resolve_href(opf_name: str, href: str) -> str:
+    """Resolve a manifest href (relative to the OPF's own directory) to a full zip member path."""
+    if "/" not in opf_name:
+        return href
+    return opf_name.rsplit("/", 1)[0] + "/" + href
+
+
+def _reparse_as_xhtml(data: bytes) -> bytes:
+    """
+    Lenient reparse of a broken (X)HTML content document into well-formed
+    XML, for repair_epub.
+
+    Uses the HTML5 parsing algorithm (via html5lib) rather than libxml2's
+    HTML recovery mode: real-world OCR garbage can contain characters that
+    are invalid even in a tag/attribute *name* (e.g. a literal "<" inside
+    one, from mis-rendered markdown), and libxml2's recovery mode carries
+    those straight through into a tree that etree.tostring then can't
+    serialize as XML at all. html5lib instead coerces invalid names into
+    XML-safe ones per spec, so it reliably produces well-formed output.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # DataLossWarning on name coercion
+        doc = html5parser.fromstring(data)
+    return etree.tostring(doc, encoding="utf-8", method="xml")
+
+
+def _repair_cover_manifest_entry(
+    opf_bytes: bytes, old_href: str, new_href: str, new_mime: str
+) -> bytes:
+    """Point the manifest <item> for the cover at its re-encoded replacement."""
+    tree = etree.fromstring(opf_bytes)
+    ns = {"opf": "http://www.idpf.org/2007/opf"}
+    for item in tree.findall(".//opf:manifest/opf:item", ns):
+        if item.get("href") == old_href:
+            item.set("href", new_href)
+            item.set("media-type", new_mime)
+    return etree.tostring(tree, xml_declaration=True, encoding="utf-8")
+
+
+def validate_epub_report(path: str) -> list[str]:
+    """
+    Non-raising validation for an already-built EPUB sitting in the output
+    library (as opposed to _validate_epub, which raises during build). Adds
+    one soft hint on top of the hard structural checks: flags a cover image
+    that isn't already a flattened baseline JPEG, since that's the format
+    _prepare_cover normalizes to for new builds and some e-reader firmware
+    rejects other covers outright even though they decode fine.
+    """
+    try:
+        issues = _collect_issues(path)
+    except (zipfile.BadZipFile, OSError) as e:
+        return [f"Could not open as a zip archive: {e}"]
+
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+            opf_name = next((n for n in names if n.endswith(".opf")), None)
+            if opf_name:
+                cover_href = _find_cover_href(zf.read(opf_name))
+                cover_path = _resolve_href(opf_name, cover_href) if cover_href else None
+                if cover_path and cover_path in names:
+                    img = Image.open(io.BytesIO(zf.read(cover_path)))
+                    img.load()
+                    if img.format != "JPEG" or img.mode != "RGB":
+                        issues.append(
+                            f"{cover_path}: cover is {img.format}/{img.mode}, not a "
+                            "flattened baseline JPEG — some e-readers reject this"
+                        )
+    except (zipfile.BadZipFile, OSError, etree.XMLSyntaxError, UnidentifiedImageError):
+        pass  # best-effort hint on top of the hard checks already collected
+
+    return issues
+
+
+def repair_epub(path: str) -> dict:
+    """
+    Attempt to repair an EPUB previously written by this app in place:
+    re-serialize any content document that isn't well-formed XML, and
+    re-encode the cover image as a flattened baseline JPEG if it isn't one
+    already (see validate_epub_report). Assumes this app's own package
+    layout — one flat directory holding the OPF, all content documents, and
+    images, with manifest hrefs as bare filenames relative to it — so
+    reference rewrites are plain basename substitutions once resolved
+    against the OPF's directory.
+
+    Anything else wrong with the file (corrupt archive, missing mimetype,
+    non-cover images that fail to decode) isn't safely auto-fixable and is
+    reported instead; those files need to be reconverted from the source PDF.
+
+    The original file is preserved at "<path>.bak" before being overwritten.
+    """
+    issues_before = validate_epub_report(path)
+
+    try:
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+            contents = {name: zf.read(name) for name in names}
+    except (zipfile.BadZipFile, OSError) as e:
+        return {
+            "changed": False,
+            "issues_before": issues_before,
+            "issues_after": issues_before,
+            "unfixable": [f"Archive could not be opened: {e}"],
+        }
+
+    changed = False
+    unfixable = []
+
+    # 1. Repair malformed XHTML/HTML content documents.
+    for name in list(contents):
+        if not name.endswith((".xhtml", ".html")):
+            continue
+        data = contents[name]
+        try:
+            etree.fromstring(data)
+            continue
+        except etree.XMLSyntaxError:
+            pass
+        try:
+            repaired = _reparse_as_xhtml(data)
+            etree.fromstring(repaired)  # verify the repair actually took
+        except Exception as e:
+            unfixable.append(f"{name}: could not be repaired ({e})")
+            continue
+        contents[name] = repaired
+        changed = True
+
+    # 2. Re-normalize the cover image if it isn't already a baseline JPEG.
+    opf_name = next((n for n in names if n.endswith(".opf")), None)
+    if opf_name:
+        try:
+            cover_href = _find_cover_href(contents[opf_name])
+        except etree.XMLSyntaxError as e:
+            cover_href = None
+            unfixable.append(f"{opf_name}: could not read manifest ({e})")
+
+        cover_path = _resolve_href(opf_name, cover_href) if cover_href else None
+        if cover_path and cover_path in contents:
+            cover_bytes = contents[cover_path]
+            is_baseline_jpeg = False
+            try:
+                img = Image.open(io.BytesIO(cover_bytes))
+                img.load()
+                is_baseline_jpeg = img.format == "JPEG" and img.mode == "RGB"
+            except (UnidentifiedImageError, OSError) as e:
+                unfixable.append(f"{cover_path}: cover image is not decodable ({e})")
+
+            if not is_baseline_jpeg:
+                prepared = _prepare_cover(cover_bytes)
+                if prepared is None:
+                    unfixable.append(f"{cover_path}: cover image could not be re-encoded")
+                else:
+                    new_bytes, new_href, new_mime = prepared
+                    new_path = _resolve_href(opf_name, new_href)
+                    if new_path != cover_path:
+                        del contents[cover_path]
+                        old, new = cover_href.encode(), new_href.encode()
+                        for name in list(contents):
+                            if name.endswith((".xhtml", ".html", ".ncx")) and old in contents[name]:
+                                contents[name] = contents[name].replace(old, new)
+                    contents[opf_name] = _repair_cover_manifest_entry(
+                        contents[opf_name], cover_href, new_href, new_mime
+                    )
+                    contents[new_path] = new_bytes
+                    changed = True
+
+    if not changed:
+        return {
+            "changed": False,
+            "issues_before": issues_before,
+            "issues_after": issues_before,
+            "unfixable": unfixable,
+        }
+
+    backup_path = path + ".bak"
+    shutil.copy2(path, backup_path)
+
+    final_names = list(contents.keys())
+    if "mimetype" in final_names:
+        final_names.remove("mimetype")
+        final_names.insert(0, "mimetype")
+
+    tmp_path = path + ".tmp"
+    with zipfile.ZipFile(tmp_path, "w") as zf:
+        for name in final_names:
+            # mimetype must be first and stored uncompressed per the EPUB spec.
+            compress = zipfile.ZIP_STORED if name == "mimetype" else zipfile.ZIP_DEFLATED
+            zf.writestr(name, contents[name], compress_type=compress)
+    os.replace(tmp_path, path)
+
+    issues_after = validate_epub_report(path)
+    return {
+        "changed": True,
+        "issues_before": issues_before,
+        "issues_after": issues_after,
+        "unfixable": unfixable,
+        "backup": os.path.basename(backup_path),
+    }
 
 
 def build_epub(
