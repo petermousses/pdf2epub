@@ -5,6 +5,7 @@ Build an EPUB from OCR-extracted markdown text and an optional cover image.
 import html
 import io
 import os
+import posixpath
 import re
 import shutil
 import uuid
@@ -23,15 +24,71 @@ from PIL import Image, UnidentifiedImageError
 logger = logging.getLogger(__name__)
 
 XHTML_NS = "http://www.w3.org/1999/xhtml"
+XML_NS = "http://www.w3.org/XML/1998/namespace"
+OPS_NS = "http://www.idpf.org/2007/ops"
+
+# A single oversized XHTML file (a whole book in one spine document) makes
+# e-readers slow to paginate and some crash outright; chapters larger than
+# this are split at paragraph boundaries.
+MAX_CHAPTER_CHARS = int(os.environ.get("EPUB_MAX_CHAPTER_CHARS", "30000"))
+
+# ── Content whitelist ────────────────────────────────────────────────────────
+# OCR output routinely contains stray angle-bracket sequences that markdown
+# passes through as raw HTML. Some of those parse into *well-formed* XML that
+# is nevertheless invalid EPUB content (<page>, <name>, <xsl:template>, ...),
+# which strict readers and EPUBCheck reject. Everything the builder ships is
+# therefore filtered against the XHTML elements markdown can legitimately
+# produce; anything else is unwrapped (tags dropped, text kept).
+ALLOWED_TAGS = {
+    "html", "head", "title", "meta", "link", "style", "body",
+    "h1", "h2", "h3", "h4", "h5", "h6", "p", "div", "span", "section",
+    "nav", "article", "aside", "header", "footer", "figure", "figcaption",
+    "a", "em", "strong", "b", "i", "u", "s", "small", "sub", "sup", "br",
+    "hr", "abbr", "cite", "q", "dfn", "kbd", "samp", "var", "time", "mark",
+    "ins", "del", "ul", "ol", "li", "dl", "dt", "dd", "blockquote", "pre",
+    "code", "table", "caption", "thead", "tbody", "tfoot", "tr", "th", "td",
+    "img", "details", "summary",
+}
+
+# Elements that are only valid inside specific parents; markdown never emits
+# them elsewhere, so a violation is always OCR garbage.
+PARENT_REQUIRED = {
+    "li": {"ul", "ol"},
+    "dt": {"dl"}, "dd": {"dl"},
+    "tr": {"table", "thead", "tbody", "tfoot"},
+    "td": {"tr"}, "th": {"tr"},
+    "thead": {"table"}, "tbody": {"table"}, "tfoot": {"table"},
+    "caption": {"table"},
+}
+
+GLOBAL_ATTRS = {"id", "class", "title", "lang", "dir", "style", "role"}
+TAG_ATTRS = {
+    "a": {"href", "rel"},
+    "img": {"src", "alt", "width", "height"},
+    "link": {"href", "rel", "type", "media"},
+    "meta": {"name", "content", "charset", "http-equiv"},
+    "th": {"colspan", "rowspan", "scope"},
+    "td": {"colspan", "rowspan"},
+    "ol": {"start", "type"},
+    "time": {"datetime"},
+}
+# Namespaced attributes that legitimately appear in our documents (nav docs
+# carry epub:type; ebooklib's wrapper sets xml:lang and epub:prefix).
+ALLOWED_NS_ATTRS = {
+    f"{{{XML_NS}}}lang", f"{{{XML_NS}}}space",
+    f"{{{OPS_NS}}}type", f"{{{OPS_NS}}}prefix",
+}
+
+IMG_REF_RE = re.compile(r"images/page_(\d+)_(\d+)\.(jpe?g|png|gif|webp)", re.I)
 
 
 def _split_chapters(text: str) -> list[tuple[str, str]]:
     """
-    Split markdown text into (title, content) chapters at H1/H2 headings.
+    Split markdown text into (title, content) chapters at H1/H2 headings
+    (up to 3 leading spaces tolerated, as in the markdown spec).
     Falls back to a single chapter if no headings found.
     """
-    # Split on lines that start with # or ##
-    chapter_re = re.compile(r"^(#{1,2})\s+(.+)$", re.MULTILINE)
+    chapter_re = re.compile(r"^\s{0,3}(#{1,2})\s+(.+)$", re.MULTILINE)
     matches = list(chapter_re.finditer(text))
 
     if not matches:
@@ -48,33 +105,268 @@ def _split_chapters(text: str) -> list[tuple[str, str]]:
     return chapters
 
 
-def _sanitize_html_fragment(body: str, chapter_title: str) -> str:
+def _split_oversized(
+    chapters: list[tuple[str, str]], max_chars: int = MAX_CHAPTER_CHARS
+) -> list[tuple[str, str]]:
     """
-    Guarantee an HTML fragment produced by python-markdown is well-formed XML.
+    Break any chapter larger than max_chars into parts at paragraph
+    boundaries. OCR output for a whole book sometimes contains no usable
+    headings at all, and a 600-page book shipped as one XHTML file
+    paginates painfully slowly (or crashes) on real readers.
+    """
+    out = []
+    for title, content in chapters:
+        if len(content) <= max_chars:
+            out.append((title, content))
+            continue
+        paragraphs = re.split(r"\n\s*\n", content)
+        parts: list[str] = []
+        current: list[str] = []
+        current_len = 0
+        for para in paragraphs:
+            if current and current_len + len(para) > max_chars:
+                parts.append("\n\n".join(current))
+                current, current_len = [], 0
+            current.append(para)
+            current_len += len(para) + 2
+        if current:
+            parts.append("\n\n".join(current))
+        if len(parts) <= 1:
+            out.append((title, content))
+        else:
+            logger.info("Chapter %r (%d chars) split into %d parts",
+                        title, len(content), len(parts))
+            out.extend(
+                (f"{title} ({i}/{len(parts)})", part)
+                for i, part in enumerate(parts, 1)
+            )
+    return out
 
-    OCR'd source text sometimes contains stray '<'/'>' sequences (generics
-    like "List<Item>", comparisons like "a<b", math/footnote notation) that
-    python-markdown treats as raw HTML passthrough and leaves unescaped and
-    unclosed. The resulting XHTML file is not well-formed XML. EPUB content
-    documents are XML, and strict e-reader firmware parses them as such —
-    it will fail (or hang) loading a chapter that isn't well-formed, even
-    though lenient tools like browsers or Calibre tolerate it. Detect that
-    case and repair it with a lenient HTML parser so the shipped file is
-    always valid XML.
+
+def extract_pdf_images_for_markdown(pdf_path: str, ocr_text: str) -> dict[str, bytes]:
     """
-    probe = f"<div xmlns='{XHTML_NS}'>{body}</div>"
+    Resolve image references the OCR model emits in its markdown
+    ('images/page_<page>_<index>.jpg') to actual image bytes pulled out of
+    the source PDF, so the EPUB can package them instead of shipping broken
+    <img> tags. Unresolvable references return no entry — the sanitizer
+    then strips those tags.
+
+    Images are re-encoded to match the referenced extension (readers and
+    EPUBCheck expect content, manifest media-type, and extension to agree).
+    """
+    refs: dict[tuple[int, int], str] = {}
+    for m in IMG_REF_RE.finditer(ocr_text):
+        refs.setdefault((int(m.group(1)), int(m.group(2))), m.group(0))
+    if not refs:
+        return {}
+
+    import fitz  # deferred: only conversion jobs need PyMuPDF here
+
+    out: dict[str, bytes] = {}
+    doc = fitz.open(pdf_path)
     try:
-        etree.fromstring(probe.encode("utf-8"))
-        return body
-    except etree.XMLSyntaxError as e:
-        logger.warning(
-            "Chapter %r: markdown output was not well-formed XML (%s); repairing",
-            chapter_title,
-            e,
-        )
+        for (page_no, img_no), ref in sorted(refs.items()):
+            if not 0 <= page_no < len(doc):
+                logger.warning("OCR referenced %s but PDF has no page %d", ref, page_no)
+                continue
+            images = doc[page_no].get_images(full=True)
+            if not 0 <= img_no < len(images):
+                logger.warning("OCR referenced %s but page %d has %d image(s)",
+                               ref, page_no, len(images))
+                continue
+            xref = images[img_no][0]
+            try:
+                raw = doc.extract_image(xref)["image"]
+                img = Image.open(io.BytesIO(raw))
+                img.load()
+                target_jpeg = ref.lower().endswith((".jpg", ".jpeg"))
+                buf = io.BytesIO()
+                if target_jpeg:
+                    if img.mode not in ("RGB", "L"):
+                        img = img.convert("RGB")
+                    img.save(buf, format="JPEG", quality=90)
+                else:
+                    if img.mode == "CMYK":
+                        img = img.convert("RGB")
+                    img.save(buf, format="PNG")
+                out[ref] = buf.getvalue()
+            except (UnidentifiedImageError, OSError, ValueError) as e:
+                logger.warning("Could not extract %s from PDF: %s", ref, e)
+    finally:
+        doc.close()
+
+    logger.info("Extracted %d/%d OCR-referenced images from the PDF",
+                len(out), len(refs))
+    return out
+
+
+def _localname(el) -> str | None:
+    """Lowercased tag name without namespace, or None for comments/PIs."""
+    tag = el.tag
+    if not isinstance(tag, str):
+        return None
+    if "}" in tag:
+        tag = tag.rsplit("}", 1)[1]
+    return tag.lower()
+
+
+def _remove_element(el) -> None:
+    """Delete an element but keep its tail text in place."""
+    parent = el.getparent()
+    if el.tail:
+        prev = el.getprevious()
+        if prev is not None:
+            prev.tail = (prev.tail or "") + el.tail
+        else:
+            parent.text = (parent.text or "") + el.tail
+    parent.remove(el)
+
+
+def _unwrap_element(el) -> None:
+    """Replace an element with its own text and children (drop just the tags)."""
+    parent = el.getparent()
+    pos = parent.index(el)
+    children = list(el)
+    if el.text:
+        if pos > 0:
+            sib = parent[pos - 1]
+            sib.tail = (sib.tail or "") + el.text
+        else:
+            parent.text = (parent.text or "") + el.text
+    for i, child in enumerate(children):
+        parent.insert(pos + i, child)
+    if el.tail:
+        if children:
+            children[-1].tail = (children[-1].tail or "") + el.tail
+        elif pos > 0:
+            parent[pos - 1].tail = (parent[pos - 1].tail or "") + el.tail
+        else:
+            parent.text = (parent.text or "") + el.tail
+    parent.remove(el)
+
+
+def _clean_attributes(el, local: str) -> int:
+    allowed = GLOBAL_ATTRS | TAG_ATTRS.get(local, set())
+    dropped = 0
+    for name in list(el.attrib):
+        if name in ALLOWED_NS_ATTRS:
+            continue
+        if name.startswith("aria-") or name.startswith("data-"):
+            continue
+        if name in allowed:
+            continue
+        del el.attrib[name]
+        dropped += 1
+    return dropped
+
+
+def _sanitize_tree(root, allowed_image_srcs: frozenset | None = None) -> int:
+    """
+    Enforce the content whitelist on a parsed (X)HTML tree, in place.
+
+    * comments/PIs are removed;
+    * elements outside ALLOWED_TAGS (or violating PARENT_REQUIRED nesting)
+      are unwrapped — their tags vanish, their text/children stay;
+    * attributes outside the allowlist are dropped (this is what scrubs the
+      'xmlnsU0003Aepub'-style names html5lib coercion leaves behind);
+    * <img> whose src is not in allowed_image_srcs is removed, so no
+      document ever ships a reference to an image that isn't packaged.
+
+    Returns the number of modifications made (0 = tree was already clean).
+    """
+    changes = 0
+    elements = list(root.iter())
+    # Reverse document order processes children before their parents, so an
+    # unwrapped element's children have already been vetted.
+    for el in reversed(elements):
+        local = _localname(el)
+        if el is root:
+            if local is not None:
+                changes += _clean_attributes(el, local)
+            continue
+        if local is None:  # comment / processing instruction
+            _remove_element(el)
+            changes += 1
+            continue
+        if local not in ALLOWED_TAGS or ":" in local:
+            _unwrap_element(el)
+            changes += 1
+            continue
+        required = PARENT_REQUIRED.get(local)
+        if required is not None:
+            parent_local = _localname(el.getparent()) or ""
+            if parent_local not in required:
+                _unwrap_element(el)
+                changes += 1
+                continue
+        if local == "img":
+            src = el.get("src")
+            if not src or (allowed_image_srcs is not None
+                           and src not in allowed_image_srcs):
+                _remove_element(el)
+                changes += 1
+                continue
+        changes += _clean_attributes(el, local)
+    return changes
+
+
+def _sanitize_html_fragment(
+    body: str,
+    chapter_title: str,
+    allowed_image_srcs: frozenset = frozenset(),
+) -> str:
+    """
+    Turn python-markdown output into guaranteed-valid XHTML body content.
+
+    OCR'd source text routinely contains stray '<'/'>' sequences (generics
+    like "List<Item>", comparisons, page markers like "<page>") that
+    python-markdown passes through as raw HTML. Two failure modes result:
+    output that isn't well-formed XML at all, and output that IS well-formed
+    but uses elements/attributes that are not valid EPUB content — strict
+    e-reader firmware and EPUBCheck reject both. Every fragment is therefore
+    parsed leniently and filtered against the content whitelist before it
+    ships; if even that fails, the fragment degrades to escaped literal text
+    rather than a broken chapter.
+    """
+    try:
         fragment = lhtml.fragment_fromstring(body, create_parent="div")
-        repaired = etree.tostring(fragment, encoding="unicode", method="xml")
-        return repaired[len("<div>") : -len("</div>")]
+        changes = _sanitize_tree(fragment, allowed_image_srcs)
+        parts = [html.escape(fragment.text) if fragment.text else ""]
+        parts += [etree.tostring(child, encoding="unicode", method="xml")
+                  for child in fragment]
+        out = "".join(parts)
+        # Belt and braces: the result must be embeddable in an XHTML doc.
+        etree.fromstring(f"<div xmlns='{XHTML_NS}'>{out}</div>".encode("utf-8"))
+        if changes:
+            logger.warning(
+                "Chapter %r: sanitized %d invalid HTML construct(s) from OCR output",
+                chapter_title, changes,
+            )
+        return out
+    except (etree.XMLSyntaxError, etree.ParserError, ValueError) as e:
+        logger.warning(
+            "Chapter %r: could not sanitize markdown output (%s); "
+            "falling back to escaped text", chapter_title, e,
+        )
+        return f"<p>{html.escape(body)}</p>"
+
+
+def _fix_text_encoding(text: str) -> str:
+    """
+    Repair mojibake in OCR output (e.g. 'O'REILLYÂ®' for 'O'REILLY®' —
+    UTF-8 bytes decoded as Latin-1 somewhere upstream) before it is baked
+    into the book. ftfy detects and undoes these double-encodings without
+    touching already-correct text.
+    """
+    try:
+        import ftfy
+    except ImportError:
+        logger.warning("ftfy not installed; skipping mojibake repair")
+        return text
+    fixed = ftfy.fix_text(text)
+    if fixed != text:
+        logger.info("Repaired encoding damage in OCR text")
+    return fixed
 
 
 def _prepare_cover(image_bytes: bytes) -> tuple[bytes, str, str] | None:
@@ -262,9 +554,11 @@ def validate_epub_report(path: str) -> list[str]:
 def repair_epub(path: str) -> dict:
     """
     Attempt to repair an EPUB previously written by this app in place:
-    re-serialize any content document that isn't well-formed XML, and
-    re-encode the cover image as a flattened baseline JPEG if it isn't one
-    already (see validate_epub_report). Assumes this app's own package
+    re-serialize any content document that isn't well-formed XML, scrub all
+    content documents against the same element/attribute whitelist new
+    builds use (removing OCR-passthrough garbage and broken image
+    references), and re-encode the cover image as a flattened baseline JPEG
+    if it isn't one already (see validate_epub_report). Assumes this app's own package
     layout — one flat directory holding the OPF, all content documents, and
     images, with manifest hrefs as bare filenames relative to it — so
     reference rewrites are plain basename substitutions once resolved
@@ -293,23 +587,42 @@ def repair_epub(path: str) -> dict:
     changed = False
     unfixable = []
 
-    # 1. Repair malformed XHTML/HTML content documents.
+    # 1. Repair XHTML/HTML content documents: reparse the ones that aren't
+    # well-formed XML, then run every document through the content-whitelist
+    # sanitizer. The sanitizer removes what strict readers/EPUBCheck reject
+    # even in well-formed files: bogus elements from OCR passthrough
+    # (<page>, <name>, ...), mangled attribute names left by an earlier
+    # html5lib repair ('xmlnsU0003Aepub'), and <img> references to files
+    # that aren't in the archive. Docs are only rewritten when something
+    # actually changed.
+    archive_names = [n for n in contents
+                     if n != "mimetype" and not n.startswith("META-INF/")]
     for name in list(contents):
         if not name.endswith((".xhtml", ".html")):
             continue
         data = contents[name]
+        was_malformed = False
         try:
-            etree.fromstring(data)
-            continue
+            doc = etree.fromstring(data)
         except etree.XMLSyntaxError:
-            pass
-        try:
-            repaired = _reparse_as_xhtml(data)
-            etree.fromstring(repaired)  # verify the repair actually took
-        except Exception as e:
-            unfixable.append(f"{name}: could not be repaired ({e})")
+            was_malformed = True
+            try:
+                repaired = _reparse_as_xhtml(data)
+                doc = etree.fromstring(repaired)  # verify the repair actually took
+            except Exception as e:
+                unfixable.append(f"{name}: could not be repaired ({e})")
+                continue
+
+        base = posixpath.dirname(name)
+        allowed_srcs = frozenset(
+            posixpath.relpath(member, base) if base else member
+            for member in archive_names
+        )
+        sanitize_changes = _sanitize_tree(doc, allowed_srcs)
+        if not (was_malformed or sanitize_changes):
             continue
-        contents[name] = repaired
+        contents[name] = etree.tostring(
+            doc, xml_declaration=True, encoding="utf-8")
         changed = True
 
     # 2. Re-normalize the cover image if it isn't already a baseline JPEG.
@@ -392,6 +705,7 @@ def build_epub(
     output_path: str,
     cover_image_bytes: bytes | None = None,
     cover_image_mime: str = "image/jpeg",
+    images: dict[str, bytes] | None = None,
 ):
     """
     Assemble and write an EPUB file.
@@ -405,12 +719,30 @@ def build_epub(
         cover_image_mime: MIME type of cover image (unused; the image is
             re-encoded to JPEG regardless of source format — see
             _prepare_cover).
+        images: Package-relative path -> bytes for images the OCR markdown
+            references (see extract_pdf_images_for_markdown). <img> tags
+            pointing anywhere else are stripped rather than shipped broken.
     """
+    ocr_text = _fix_text_encoding(ocr_text)
+    images = images or {}
+    allowed_image_srcs = frozenset(images)
+
     book = epub.EpubBook()
     book.set_identifier(str(uuid.uuid4()))
     book.set_title(title)
     book.set_language("en")
     book.add_author(author)
+
+    for i, (image_name, image_bytes) in enumerate(sorted(images.items())):
+        ext = image_name.rsplit(".", 1)[-1].lower()
+        mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/jpeg")
+        book.add_item(epub.EpubItem(
+            uid=f"img_{i:04d}",
+            file_name=image_name,
+            media_type=mime,
+            content=image_bytes,
+        ))
 
     # Cover image
     if cover_image_bytes:
@@ -430,15 +762,18 @@ def build_epub(
 body { font-family: Georgia, serif; line-height: 1.6; margin: 1em 2em; }
 h1, h2, h3 { margin-top: 1.5em; }
 p { margin: 0.5em 0; text-indent: 1.5em; }
+img { max-width: 100%; height: auto; }
 pre, code { font-family: monospace; background: #f4f4f4; padding: 0.2em 0.4em; }
+pre { white-space: pre-wrap; overflow-wrap: break-word; }
+code { overflow-wrap: break-word; }
 table { border-collapse: collapse; width: 100%; }
-th, td { border: 1px solid #ccc; padding: 0.4em 0.8em; }
+th, td { border: 1px solid #ccc; padding: 0.4em 0.8em; overflow-wrap: break-word; }
 """,
     )
     book.add_item(css)
 
     # Split into chapters
-    chapters = _split_chapters(ocr_text)
+    chapters = _split_oversized(_split_chapters(ocr_text))
     epub_chapters = []
 
     for idx, (chapter_title, chapter_md) in enumerate(chapters):
@@ -446,7 +781,7 @@ th, td { border: 1px solid #ccc; padding: 0.4em 0.8em; }
             chapter_md,
             extensions=["tables", "fenced_code"],
         )
-        html_body = _sanitize_html_fragment(html_body, chapter_title)
+        html_body = _sanitize_html_fragment(html_body, chapter_title, allowed_image_srcs)
         safe_title = html.escape(chapter_title, quote=False)
         chapter = epub.EpubHtml(
             title=chapter_title,

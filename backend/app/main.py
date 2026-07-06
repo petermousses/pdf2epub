@@ -44,7 +44,12 @@ from .ocr import (
     get_model_status,
     is_model_ready,
 )
-from .epub_builder import build_epub, validate_epub_report, repair_epub
+from .epub_builder import (
+    build_epub,
+    extract_pdf_images_for_markdown,
+    validate_epub_report,
+    repair_epub,
+)
 from .epub_validator import validate_full
 
 logging.basicConfig(level=logging.INFO)
@@ -202,9 +207,15 @@ def _run_job(job_id: str, cover_page: Optional[int], output_filename: str):
         if not ocr_text.strip():
             raise RuntimeError("OCR returned no text. Check that the PDF is legible.")
 
-        _update_job(job_id, step=f"OCR complete ({len(ocr_text)} chars). Building EPUB...")
+        _update_job(job_id, step=f"OCR complete ({len(ocr_text)} chars). Extracting figures...")
 
-        # ── 4. Build EPUB ──
+        # ── 4. Pull the images the OCR markdown references out of the PDF ──
+        # so the EPUB packages real figures instead of broken <img> tags.
+        images = extract_pdf_images_for_markdown(pdf_path, ocr_text)
+
+        _update_job(job_id, step="Building EPUB...")
+
+        # ── 5. Build EPUB ──
         original_name = job.get("original_name", "document.pdf")
         title = output_filename or Path(original_name).stem
         safe_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in title).strip()
@@ -218,6 +229,7 @@ def _run_job(job_id: str, cover_page: Optional[int], output_filename: str):
             output_path=epub_path,
             cover_image_bytes=cover_bytes,
             cover_image_mime="image/png",
+            images=images,
         )
 
         _update_job(
