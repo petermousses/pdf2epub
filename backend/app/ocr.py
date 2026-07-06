@@ -267,27 +267,65 @@ def run_ocr(image_paths: list[str], progress_callback=None) -> str:
     """
     wait_for_model()
 
+    # ~4 096 tokens per page is generous for typical book/document content.
+    # Capping proportionally prevents the model from filling unused budget
+    # with hallucinated text when pages are sparse or short.
+    MAX_TOKENS_PER_PAGE = 4096
+
     def _infer(batch: list[str], out_dir: str):
+        batch_max = min(32768, MAX_TOKENS_PER_PAGE * len(batch))
         return _model.infer_multi(
             _tokenizer,
             prompt="<image>Multi page parsing.",
             image_files=batch,
             output_path=out_dir,
             image_size=1024,
-            max_length=32768,
+            max_length=batch_max,
             no_repeat_ngram_size=35,
-            ngram_window=1024,
+            ngram_window=min(1024, batch_max),
             save_results=True,
         )
 
+    def _clean(text: str) -> str:
+        """
+        Strip LLM artefacts from raw model output before it reaches the EPUB:
+
+        • Markdown code-fence wrappers (```markdown … ``` or ``` … ```)
+          Some models wrap their entire output in a fenced block.
+        • Common chat/instruction special tokens (<|im_end|>, </s>, <|eot|>, …)
+        • Leading/trailing whitespace
+        """
+        import re as _re
+
+        # Strip outer code-fence wrapper produced by some model checkpoints.
+        # Matches ``` or ```markdown / ```text at the start, ``` at the end.
+        stripped = _re.sub(
+            r"^```[a-zA-Z]*\n([\s\S]*?)\n```\s*$",
+            r"\1",
+            text.strip(),
+        )
+        # Fall back to the raw text if the regex didn't match (not wrapped).
+        text = stripped if stripped != text.strip() else text
+
+        # Remove well-known special tokens produced by various base models.
+        for token in (
+            "<|im_end|>", "<|im_start|>", "<|endoftext|>",
+            "</s>", "<s>", "<|eot_id|>", "<|start_header_id|>",
+            "<|end_header_id|>", "<|finetune_right_pad_id|>",
+        ):
+            text = text.replace(token, "")
+
+        return text.strip()
+
     def _extract_text(result, out_dir: str) -> str:
-        # infer_multi returns (markdown_text, output_token_count); take the text.
+        # infer_multi may return (markdown_text, token_count) or just the text.
         if isinstance(result, (list, tuple)):
             result = result[0] if result else None
-        if isinstance(result, str) and result.strip():
-            return result
-        # Fall back to reading saved output files (result.md).
-        return _collect_ocr_output(out_dir)
+        raw = result if isinstance(result, str) and result.strip() else _collect_ocr_output(out_dir)
+        cleaned = _clean(raw) if raw else ""
+        if cleaned:
+            logger.debug("OCR batch output: %d chars — preview: %.200s", len(cleaned), cleaned)
+        return cleaned
 
     with _model_lock:
         # Grab the GPU for this job, waiting for VRAM if Ollama is using it.
