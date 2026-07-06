@@ -8,12 +8,18 @@ Endpoints:
   GET  /api/status/{job_id}           Poll job status
   GET  /api/model-status   Check model loading status
   GET  /api/library                   List EPUBs in the output directory
-  POST /api/library/{filename}/validate  Check an existing EPUB for problems
+  POST /api/library/{filename}/validate  Quick structural check of an EPUB
+  POST /api/library/{filename}/validate-full  Full validation: spec (EPUBCheck),
+                                      simulated Chromium renders, and — when a
+                                      source PDF is attached — fidelity comparison
+  GET  /api/library/{filename}/validation-report  Last stored full report
+  GET  /api/library/{filename}/screenshots/{shot}  Render screenshot (PNG)
   POST /api/library/{filename}/fix       Attempt to repair a broken EPUB
 """
 
 import os
 import io
+import json
 import uuid
 import shutil
 import asyncio
@@ -39,6 +45,7 @@ from .ocr import (
     is_model_ready,
 )
 from .epub_builder import build_epub, validate_epub_report, repair_epub
+from .epub_validator import validate_full
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -304,6 +311,107 @@ async def validate_library_epub(filename: str):
     path = _library_path(filename)
     issues = validate_epub_report(str(path))
     return {"filename": path.name, "valid": not issues, "issues": issues}
+
+
+def _validation_dir(epub_path: Path) -> Path:
+    return OUTPUT_DIR / ".validation" / epub_path.stem
+
+
+def _find_source_pdf(filename: str) -> Optional[str]:
+    """If the job that produced this EPUB is still around, reuse its input PDF."""
+    with JOBS_LOCK:
+        for job in JOBS.values():
+            if job.get("output_file") == filename and os.path.isfile(job.get("pdf_path", "")):
+                return job["pdf_path"]
+    return None
+
+
+@app.post("/api/library/{filename}/validate-full")
+async def validate_library_epub_full(
+    filename: str,
+    pdf: Optional[UploadFile] = File(None),
+    render: bool = True,
+    epubcheck: bool = True,
+    screenshots: bool = True,
+):
+    """
+    Full validation of an EPUB in the library:
+
+      * format  — OCF/OPF/content checks + the official W3C EPUBCheck
+      * render  — every spine document opened in headless Chromium
+      * fidelity — text/TOC/image comparison against the source PDF, when one
+        is attached as multipart field 'pdf' (or the original upload is still
+        available from the conversion job)
+
+    The JSON report is returned and also persisted next to the library so
+    GET /validation-report can serve it later.
+    """
+    path = _library_path(filename)
+
+    pdf_path = _find_source_pdf(filename)
+    tmp_pdf = None
+    if pdf is not None:
+        if not (pdf.filename or "").lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Comparison file must be a PDF")
+        contents = await pdf.read()
+        tmp_pdf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        tmp_pdf.write(contents)
+        tmp_pdf.close()
+        pdf_path = tmp_pdf.name
+
+    report_dir = _validation_dir(path)
+    shots_dir = None
+    if render and screenshots:
+        shots_dir = report_dir / "screenshots"
+        shutil.rmtree(shots_dir, ignore_errors=True)
+
+    try:
+        report = await asyncio.to_thread(
+            validate_full,
+            str(path),
+            pdf_path=pdf_path,
+            render=render,
+            epubcheck=epubcheck,
+            screenshots_dir=str(shots_dir) if shots_dir else None,
+        )
+    finally:
+        if tmp_pdf is not None:
+            os.unlink(tmp_pdf.name)
+
+    # Screenshots as API-servable names rather than server paths.
+    for doc in report.get("render", {}).get("documents", []):
+        if doc.get("screenshot"):
+            doc["screenshot"] = os.path.basename(doc["screenshot"])
+    report["epub"] = path.name
+    report["pdf"] = bool(pdf_path)
+
+    report_dir.mkdir(parents=True, exist_ok=True)
+    with open(report_dir / "report.json", "w", encoding="utf-8") as fp:
+        json.dump(report, fp, indent=2, ensure_ascii=False)
+
+    return report
+
+
+@app.get("/api/library/{filename}/validation-report")
+async def get_validation_report(filename: str):
+    path = _library_path(filename)
+    report_file = _validation_dir(path) / "report.json"
+    if not report_file.is_file():
+        raise HTTPException(status_code=404, detail="No stored validation report; run validate-full first")
+    with open(report_file, "r", encoding="utf-8") as fp:
+        return json.load(fp)
+
+
+@app.get("/api/library/{filename}/screenshots/{shot}")
+async def get_validation_screenshot(filename: str, shot: str):
+    path = _library_path(filename)
+    safe_shot = Path(shot).name
+    if safe_shot != shot or not safe_shot.endswith(".png"):
+        raise HTTPException(status_code=400, detail="Invalid screenshot name")
+    shot_path = _validation_dir(path) / "screenshots" / safe_shot
+    if not shot_path.is_file():
+        raise HTTPException(status_code=404, detail="Screenshot not found")
+    return Response(content=shot_path.read_bytes(), media_type="image/png")
 
 
 @app.post("/api/library/{filename}/fix")
