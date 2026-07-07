@@ -8,6 +8,7 @@ Endpoints:
   GET  /api/status/{job_id}           Poll job status
   GET  /api/model-status   Check model loading status
   GET  /api/library                   List EPUBs in the output directory
+  GET  /api/library/{filename}/download  Download an EPUB from the output directory
   POST /api/library/{filename}/validate  Check an existing EPUB for problems
   POST /api/library/{filename}/fix       Attempt to repair a broken EPUB
 """
@@ -26,7 +27,7 @@ from typing import Optional
 import fitz  # PyMuPDF
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, JSONResponse
+from fastapi.responses import Response, JSONResponse, FileResponse
 from pydantic import BaseModel
 
 from .ocr import (
@@ -297,6 +298,12 @@ async def list_library():
         st = p.stat()
         files.append({"filename": p.name, "size": st.st_size, "modified": st.st_mtime})
     return {"files": files}
+
+
+@app.get("/api/library/{filename}/download")
+async def download_library_epub(filename: str):
+    path = _library_path(filename)
+    return FileResponse(path, media_type="application/epub+zip", filename=path.name)
 
 
 @app.post("/api/library/{filename}/validate")

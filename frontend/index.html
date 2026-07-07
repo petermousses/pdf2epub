@@ -269,6 +269,22 @@
     .lib-btn:hover:not(:disabled) { border-color: var(--accent); }
     .lib-btn:disabled { opacity: 0.4; cursor: not-allowed; }
     .lib-btn.fix { background: var(--accent); border-color: var(--accent); color: #fff; }
+    a.lib-btn { text-decoration: none; display: inline-flex; align-items: center; }
+
+    a#download-btn {
+      display: inline-block;
+      margin-top: 1rem;
+      margin-right: 0.5rem;
+      padding: 0.5rem 1.2rem;
+      background: var(--accent);
+      color: #fff;
+      border-radius: 7px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      text-decoration: none;
+      transition: background 0.2s;
+    }
+    a#download-btn:hover { background: var(--accent-hover); }
   </style>
 </head>
 <body>
@@ -564,6 +580,7 @@
           <div class="file-path">${escHtml(filename)}</div>
         </div>
       </div>
+      <a id="download-btn" href="/api/library/${encodeURIComponent(filename)}/download" download>⬇ Download EPUB</a>
       <button id="reset-btn">Convert another PDF</button>
     `;
     document.getElementById('reset-btn').addEventListener('click', resetUI);
@@ -654,6 +671,7 @@
           <div class="lib-issues" data-role="issues"></div>
         </div>
         <div class="lib-actions">
+          <a class="lib-btn" href="/api/library/${encodeURIComponent(f.filename)}/download" download>Download</a>
           <button class="lib-btn" data-role="validate">Validate</button>
           <button class="lib-btn fix" data-role="fix" disabled>Fix</button>
         </div>
