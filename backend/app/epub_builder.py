@@ -48,6 +48,13 @@ def _split_chapters(text: str) -> list[tuple[str, str]]:
     return chapters
 
 
+# A tag whose name carries a namespace prefix, e.g. <xsl:template match="…">
+# or </fo:block>. python-markdown never emits prefixed elements, so one in
+# its output is always OCR'd literal text (an XML/XSLT code sample in the
+# source book) passed through as raw HTML.
+_PREFIXED_TAG_RE = re.compile(r"</?[A-Za-z][\w.-]*:[^<>]*>")
+
+
 def _sanitize_html_fragment(body: str, chapter_title: str) -> str:
     """
     Guarantee an HTML fragment produced by python-markdown is well-formed XML.
@@ -62,9 +69,9 @@ def _sanitize_html_fragment(body: str, chapter_title: str) -> str:
     case and repair it with a lenient HTML parser so the shipped file is
     always valid XML.
     """
-    probe = f"<div xmlns='{XHTML_NS}'>{body}</div>"
+    probe_template = f"<div xmlns='{XHTML_NS}'>{{}}</div>"
     try:
-        etree.fromstring(probe.encode("utf-8"))
+        etree.fromstring(probe_template.format(body).encode("utf-8"))
         return body
     except etree.XMLSyntaxError as e:
         logger.warning(
@@ -72,9 +79,33 @@ def _sanitize_html_fragment(body: str, chapter_title: str) -> str:
             chapter_title,
             e,
         )
-        fragment = lhtml.fragment_fromstring(body, create_parent="div")
-        repaired = etree.tostring(fragment, encoding="unicode", method="xml")
-        return repaired[len("<div>") : -len("</div>")]
+
+    # Namespace-prefixed tags survive the lenient HTML reparse below as
+    # elements, but XML requires their prefix to be declared, so the
+    # "repaired" fragment would still be rejected by every XML parser.
+    # Since they can only be code-sample text, escape them so they render
+    # as the visible text the book intended.
+    escaped = _PREFIXED_TAG_RE.sub(
+        lambda m: html.escape(m.group(0), quote=False), body
+    )
+
+    fragment = lhtml.fragment_fromstring(escaped, create_parent="div")
+    repaired = etree.tostring(fragment, encoding="unicode", method="xml")
+    repaired = repaired[len("<div>") : -len("</div>")]
+    try:
+        etree.fromstring(probe_template.format(repaired).encode("utf-8"))
+        return repaired
+    except etree.XMLSyntaxError as e:
+        # The lenient parse can still let non-XML constructs through. Ship
+        # the chapter as escaped preformatted text rather than an EPUB that
+        # fails validation.
+        logger.warning(
+            "Chapter %r: repair still not well-formed XML (%s); "
+            "falling back to escaped text",
+            chapter_title,
+            e,
+        )
+        return "<pre>{}</pre>".format(html.escape(body, quote=False))
 
 
 def _prepare_cover(image_bytes: bytes) -> tuple[bytes, str, str] | None:
