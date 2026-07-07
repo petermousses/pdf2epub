@@ -505,5 +505,14 @@ th, td { border: 1px solid #ccc; padding: 0.4em 0.8em; }
     book.spine = ["nav"] + epub_chapters
 
     epub.write_epub(output_path, book)
-    _validate_epub(output_path)
+    try:
+        _validate_epub(output_path)
+    except Exception:
+        # Don't leave a broken EPUB in the output directory — it would show
+        # up in the library looking like a finished book.
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+        raise
     logger.info("EPUB written to %s", output_path)
