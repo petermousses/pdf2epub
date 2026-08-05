@@ -9,12 +9,18 @@ Endpoints:
   GET  /api/model-status   Check model loading status
   GET  /api/library                   List EPUBs in the output directory
   GET  /api/library/{filename}/download  Download an EPUB from the output directory
-  POST /api/library/{filename}/validate  Check an existing EPUB for problems
+  POST /api/library/{filename}/validate  Quick structural check of an EPUB
+  POST /api/library/{filename}/validate-full  Full validation: spec (EPUBCheck),
+                                      simulated Chromium renders, and — when a
+                                      source PDF is attached — fidelity comparison
+  GET  /api/library/{filename}/validation-report  Last stored full report
+  GET  /api/library/{filename}/screenshots/{shot}  Render screenshot (PNG)
   POST /api/library/{filename}/fix       Attempt to repair a broken EPUB
 """
 
 import os
 import io
+import json
 import uuid
 import shutil
 import asyncio
@@ -33,13 +39,20 @@ from pydantic import BaseModel
 from .ocr import (
     start_model_loading,
     run_ocr,
+    pdf_to_markdown,
     pdf_to_images,
     render_page_thumbnail,
     render_page_image,
     get_model_status,
     is_model_ready,
 )
-from .epub_builder import build_epub, validate_epub_report, repair_epub
+from .epub_builder import (
+    build_epub,
+    extract_pdf_images_for_markdown,
+    validate_epub_report,
+    repair_epub,
+)
+from .epub_validator import validate_full
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -172,11 +185,20 @@ def _run_job(job_id: str, cover_page: Optional[int], output_filename: str):
         pdf_path = job["pdf_path"]
         job_dir = _job_dir(job_id)
 
-        # ── 1. Render PDF pages to images ──
-        _update_job(job_id, status="processing", step="Rendering PDF pages to images...")
-        logger.info("[%s] Rendering pages", job_id)
-        image_paths = pdf_to_images(pdf_path, dpi=300)
-        _update_job(job_id, step=f"Rendered {len(image_paths)} pages. Starting OCR...")
+        # ── 1. Prefer the PDF text layer when it exists ──
+        # This preserves the source document's Unicode equation glyphs and
+        # avoids spending GPU time OCR'ing a text-based PDF. Scanned PDFs
+        # return an empty string and continue through the OCR path.
+        source_markdown = pdf_to_markdown(pdf_path)
+        if source_markdown:
+            image_paths = []
+            _update_job(job_id, status="processing", step="Using embedded PDF text layer...")
+            logger.info("[%s] Using embedded PDF text layer", job_id)
+        else:
+            _update_job(job_id, status="processing", step="Rendering PDF pages to images...")
+            logger.info("[%s] Rendering pages", job_id)
+            image_paths = pdf_to_images(pdf_path, dpi=300)
+            _update_job(job_id, step=f"Rendered {len(image_paths)} pages. Starting OCR...")
 
         # ── 2. Extract cover image if requested ──
         cover_bytes = None
@@ -184,21 +206,30 @@ def _run_job(job_id: str, cover_page: Optional[int], output_filename: str):
             _update_job(job_id, step=f"Extracting cover from page {cover_page + 1}...")
             cover_bytes = render_page_image(pdf_path, cover_page, dpi=150)
 
-        # ── 3. Run OCR ──
-        _update_job(job_id, step="Running OCR (this may take several minutes)...")
-        logger.info("[%s] Starting OCR on %d pages", job_id, len(image_paths))
+        # ── 3. Extract text ──
+        if source_markdown:
+            ocr_text = source_markdown
+        else:
+            _update_job(job_id, step="Running OCR (this may take several minutes)...")
+            logger.info("[%s] Starting OCR on %d pages", job_id, len(image_paths))
 
-        def progress(msg):
-            _update_job(job_id, step=msg)
+            def progress(msg):
+                _update_job(job_id, step=msg)
 
-        ocr_text = run_ocr(image_paths, progress_callback=progress)
+            ocr_text = run_ocr(image_paths, progress_callback=progress)
 
         if not ocr_text.strip():
             raise RuntimeError("OCR returned no text. Check that the PDF is legible.")
 
-        _update_job(job_id, step=f"OCR complete ({len(ocr_text)} chars). Building EPUB...")
+        _update_job(job_id, step=f"OCR complete ({len(ocr_text)} chars). Extracting figures...")
 
-        # ── 4. Build EPUB ──
+        # ── 4. Pull the images the OCR markdown references out of the PDF ──
+        # so the EPUB packages real figures instead of broken <img> tags.
+        images = extract_pdf_images_for_markdown(pdf_path, ocr_text)
+
+        _update_job(job_id, step="Building EPUB...")
+
+        # ── 5. Build EPUB ──
         original_name = job.get("original_name", "document.pdf")
         title = output_filename or Path(original_name).stem
         safe_name = "".join(c if c.isalnum() or c in "-_ " else "_" for c in title).strip()
@@ -212,6 +243,7 @@ def _run_job(job_id: str, cover_page: Optional[int], output_filename: str):
             output_path=epub_path,
             cover_image_bytes=cover_bytes,
             cover_image_mime="image/png",
+            images=images,
         )
 
         _update_job(
@@ -236,7 +268,7 @@ async def process(req: ProcessRequest):
     if job["status"] == "done":
         raise HTTPException(status_code=409, detail="Job already completed")
 
-    if not is_model_ready():
+    if not is_model_ready() and not pdf_to_markdown(job["pdf_path"]):
         raise HTTPException(
             status_code=503,
             detail="Model is still loading. Please wait and try again.",
@@ -311,6 +343,107 @@ async def validate_library_epub(filename: str):
     path = _library_path(filename)
     issues = validate_epub_report(str(path))
     return {"filename": path.name, "valid": not issues, "issues": issues}
+
+
+def _validation_dir(epub_path: Path) -> Path:
+    return OUTPUT_DIR / ".validation" / epub_path.stem
+
+
+def _find_source_pdf(filename: str) -> Optional[str]:
+    """If the job that produced this EPUB is still around, reuse its input PDF."""
+    with JOBS_LOCK:
+        for job in JOBS.values():
+            if job.get("output_file") == filename and os.path.isfile(job.get("pdf_path", "")):
+                return job["pdf_path"]
+    return None
+
+
+@app.post("/api/library/{filename}/validate-full")
+async def validate_library_epub_full(
+    filename: str,
+    pdf: Optional[UploadFile] = File(None),
+    render: bool = True,
+    epubcheck: bool = True,
+    screenshots: bool = True,
+):
+    """
+    Full validation of an EPUB in the library:
+
+      * format  — OCF/OPF/content checks + the official W3C EPUBCheck
+      * render  — every spine document opened in headless Chromium
+      * fidelity — text/TOC/image comparison against the source PDF, when one
+        is attached as multipart field 'pdf' (or the original upload is still
+        available from the conversion job)
+
+    The JSON report is returned and also persisted next to the library so
+    GET /validation-report can serve it later.
+    """
+    path = _library_path(filename)
+
+    pdf_path = _find_source_pdf(filename)
+    tmp_pdf = None
+    if pdf is not None:
+        if not (pdf.filename or "").lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Comparison file must be a PDF")
+        contents = await pdf.read()
+        tmp_pdf = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+        tmp_pdf.write(contents)
+        tmp_pdf.close()
+        pdf_path = tmp_pdf.name
+
+    report_dir = _validation_dir(path)
+    shots_dir = None
+    if render and screenshots:
+        shots_dir = report_dir / "screenshots"
+        shutil.rmtree(shots_dir, ignore_errors=True)
+
+    try:
+        report = await asyncio.to_thread(
+            validate_full,
+            str(path),
+            pdf_path=pdf_path,
+            render=render,
+            epubcheck=epubcheck,
+            screenshots_dir=str(shots_dir) if shots_dir else None,
+        )
+    finally:
+        if tmp_pdf is not None:
+            os.unlink(tmp_pdf.name)
+
+    # Screenshots as API-servable names rather than server paths.
+    for doc in report.get("render", {}).get("documents", []):
+        if doc.get("screenshot"):
+            doc["screenshot"] = os.path.basename(doc["screenshot"])
+    report["epub"] = path.name
+    report["pdf"] = bool(pdf_path)
+
+    report_dir.mkdir(parents=True, exist_ok=True)
+    with open(report_dir / "report.json", "w", encoding="utf-8") as fp:
+        json.dump(report, fp, indent=2, ensure_ascii=False)
+
+    return report
+
+
+@app.get("/api/library/{filename}/validation-report")
+async def get_validation_report(filename: str):
+    path = _library_path(filename)
+    report_file = _validation_dir(path) / "report.json"
+    if not report_file.is_file():
+        raise HTTPException(status_code=404, detail="No stored validation report; run validate-full first")
+    with open(report_file, "r", encoding="utf-8") as fp:
+        return json.load(fp)
+
+
+@app.get("/api/library/{filename}/screenshots/{shot}")
+async def get_validation_screenshot(filename: str, shot: str):
+    path = _library_path(filename)
+    safe_shot = Path(shot).name
+    if safe_shot != shot or not safe_shot.endswith(".png"):
+        raise HTTPException(status_code=400, detail="Invalid screenshot name")
+    shot_path = _validation_dir(path) / "screenshots" / safe_shot
+    if not shot_path.is_file():
+        raise HTTPException(status_code=404, detail="Screenshot not found")
+    return Response(content=shot_path.read_bytes(), media_type="image/png")
 
 
 @app.post("/api/library/{filename}/fix")
