@@ -34,6 +34,12 @@ preserved; scanned PDFs continue through OCR. Generated EPUBs package figure
 references, split oversized content documents, and sanitize OCR markup before
 the file is written.
 
+The conversion API defaults to `reader_safe` mode, which omits embedded images,
+replaces recognizable equations and figures with readable placeholders, avoids
+rich table markup, and uses smaller spine documents for constrained e-readers.
+Pass `"mode": "full"` to `/api/process` when desktop-reader fidelity is more
+important than device compatibility.
+
 For an existing library book, run the full validation endpoint:
 
 ```bash

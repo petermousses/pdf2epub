@@ -28,7 +28,7 @@ import logging
 import tempfile
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import fitz  # PyMuPDF
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -176,9 +176,15 @@ class ProcessRequest(BaseModel):
     job_id: str
     cover_page: Optional[int] = None   # 0-indexed page to use as cover; None = no cover
     output_filename: Optional[str] = None  # base name without extension
+    mode: Literal["reader_safe", "full"] = "reader_safe"
 
 
-def _run_job(job_id: str, cover_page: Optional[int], output_filename: str):
+def _run_job(
+    job_id: str,
+    cover_page: Optional[int],
+    output_filename: str,
+    mode: Literal["reader_safe", "full"],
+):
     """Background thread: OCR → EPUB."""
     try:
         job = _get_job(job_id)
@@ -202,7 +208,7 @@ def _run_job(job_id: str, cover_page: Optional[int], output_filename: str):
 
         # ── 2. Extract cover image if requested ──
         cover_bytes = None
-        if cover_page is not None and 0 <= cover_page < job["page_count"]:
+        if mode == "full" and cover_page is not None and 0 <= cover_page < job["page_count"]:
             _update_job(job_id, step=f"Extracting cover from page {cover_page + 1}...")
             cover_bytes = render_page_image(pdf_path, cover_page, dpi=150)
 
@@ -221,11 +227,18 @@ def _run_job(job_id: str, cover_page: Optional[int], output_filename: str):
         if not ocr_text.strip():
             raise RuntimeError("OCR returned no text. Check that the PDF is legible.")
 
-        _update_job(job_id, step=f"OCR complete ({len(ocr_text)} chars). Extracting figures...")
+        if mode == "reader_safe":
+            _update_job(
+                job_id,
+                step=f"Text extraction complete ({len(ocr_text)} chars). Preparing reader-safe EPUB...",
+            )
+            images = {}
+        else:
+            _update_job(job_id, step=f"OCR complete ({len(ocr_text)} chars). Extracting figures...")
 
-        # ── 4. Pull the images the OCR markdown references out of the PDF ──
-        # so the EPUB packages real figures instead of broken <img> tags.
-        images = extract_pdf_images_for_markdown(pdf_path, ocr_text)
+            # ── 4. Pull the images the OCR markdown references out of the PDF ──
+            # so the EPUB packages real figures instead of broken <img> tags.
+            images = extract_pdf_images_for_markdown(pdf_path, ocr_text)
 
         _update_job(job_id, step="Building EPUB...")
 
@@ -244,6 +257,7 @@ def _run_job(job_id: str, cover_page: Optional[int], output_filename: str):
             cover_image_bytes=cover_bytes,
             cover_image_mime="image/png",
             images=images,
+            mode=mode,
         )
 
         _update_job(
@@ -279,7 +293,7 @@ async def process(req: ProcessRequest):
     # Run in a real thread so we don't block the async event loop
     t = threading.Thread(
         target=_run_job,
-        args=(req.job_id, req.cover_page, output_filename),
+        args=(req.job_id, req.cover_page, output_filename, req.mode),
         daemon=True,
     )
     t.start()

@@ -157,6 +157,18 @@
     }
     input[type="text"]:focus { border-color: var(--accent); }
 
+    select {
+      width: 100%;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 0.55rem 0.75rem;
+      border-radius: 7px;
+      font-size: 0.95rem;
+      outline: none;
+    }
+    select:focus { border-color: var(--accent); }
+
     .cover-note {
       font-size: 0.8rem;
       color: var(--muted);
@@ -318,6 +330,15 @@
 
   <!-- Thumbnails + options card -->
   <div class="card" id="thumb-section">
+    <div class="form-group">
+      <label for="output-mode">EPUB profile</label>
+      <select id="output-mode">
+        <option value="reader_safe" selected>Reader-safe (text only) — recommended</option>
+        <option value="full">Full fidelity (figures and rich formatting)</option>
+      </select>
+      <p class="cover-note">Reader-safe mode replaces figures and equations with text placeholders and uses smaller chapters for limited e-readers.</p>
+    </div>
+
     <h2 id="thumb-title">Select a cover page <span style="font-weight:400">(optional)</span></h2>
     <div id="thumb-grid"></div>
     <p class="cover-note" id="cover-note">Click a page to use it as the EPUB cover. Click again to deselect.</p>
@@ -361,6 +382,7 @@
   const thumbTitle    = document.getElementById('thumb-title');
   const coverNote     = document.getElementById('cover-note');
   const outputName    = document.getElementById('output-name');
+  const outputMode    = document.getElementById('output-mode');
   const convertBtn    = document.getElementById('convert-btn');
   const progressSec   = document.getElementById('progress-section');
   const progressBar   = document.getElementById('progress-bar');
@@ -497,6 +519,16 @@
     }
   }
 
+  outputMode.addEventListener('change', () => {
+    if (outputMode.value === 'reader_safe') {
+      coverNote.textContent = 'Reader-safe mode omits cover images; the selected page will be ignored.';
+    } else if (selectedCoverPage === null) {
+      coverNote.textContent = 'Click a page to use it as the EPUB cover. Click again to deselect.';
+    } else {
+      coverNote.textContent = `Page ${selectedCoverPage + 1} selected as cover.`;
+    }
+  });
+
   function updateConvertBtn() {
     convertBtn.disabled = !(jobId && isModelReady());
   }
@@ -515,6 +547,7 @@
       job_id: jobId,
       cover_page: selectedCoverPage,
       output_filename: outputName.value.trim() || null,
+      mode: outputMode.value,
     };
 
     try {

@@ -7,6 +7,8 @@ from pathlib import Path
 from PIL import Image
 
 from app.epub_builder import (
+    EQUATION_PLACEHOLDER,
+    _prepare_reader_safe_markdown,
     _render_math_in_markdown,
     _sanitize_html_fragment,
     _split_chapters,
@@ -38,6 +40,18 @@ class EpubBuilderTests(unittest.TestCase):
     def test_fenced_code_is_not_treated_as_math(self):
         source = "```text\nrecord_{id}\n```"
         self.assertEqual(_render_math_in_markdown(source), source)
+
+    def test_reader_safe_replaces_figures_and_equations_but_not_code(self):
+        source = (
+            "![Architecture](images/page_0_0.jpg)\n\n"
+            "The relation is σ_{family}.\n\n"
+            "```text\nrecord_{id}\n```"
+        )
+        prepared = _prepare_reader_safe_markdown(source)
+        self.assertIn("[Figure omitted: Architecture]", prepared)
+        self.assertIn(EQUATION_PLACEHOLDER, prepared)
+        self.assertIn("record_{id}", prepared)
+        self.assertNotIn("page_0_0.jpg", prepared)
 
     def test_unknown_ocr_tags_are_unwrapped_and_image_refs_are_checked(self):
         body = '<p>before</p><page>garbage</page><img src="images/missing.jpg">'
@@ -74,6 +88,37 @@ class EpubBuilderTests(unittest.TestCase):
                 )
                 self.assertIn("<sub>family</sub>", chapter)
                 self.assertIn("<img", chapter)
+
+    def test_reader_safe_build_has_no_images_or_rich_tables(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "reader-safe.epub"
+            build_epub(
+                title="Reader Safe",
+                author="Tester",
+                ocr_text=(
+                    "# Intro\n\n"
+                    "![Figure](images/page_0_0.jpg)\n\n"
+                    "σ_{family} = Sharks\n\n"
+                    "| Name | Value |\n|---|---|\n| Sharks | 2 |"
+                ),
+                output_path=str(output),
+                images={"images/page_0_0.jpg": _jpeg_bytes()},
+                mode="reader_safe",
+            )
+
+            self.assertEqual(validate_epub_report(str(output)), [])
+            with zipfile.ZipFile(output) as archive:
+                names = set(archive.namelist())
+                self.assertFalse(any(name.endswith("page_0_0.jpg") for name in names))
+                chapter = next(
+                    archive.read(name).decode("utf-8")
+                    for name in names
+                    if name.endswith("chapter_001.xhtml")
+                )
+                self.assertIn("Figure omitted", chapter)
+                self.assertIn("Equation omitted", chapter)
+                self.assertNotIn("<img", chapter)
+                self.assertNotIn("<table", chapter)
 
 
 if __name__ == "__main__":

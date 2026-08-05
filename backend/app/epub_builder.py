@@ -31,6 +31,21 @@ OPS_NS = "http://www.idpf.org/2007/ops"
 # e-readers slow to paginate and some crash outright; chapters larger than
 # this are split at paragraph boundaries.
 MAX_CHAPTER_CHARS = int(os.environ.get("EPUB_MAX_CHAPTER_CHARS", "30000"))
+READER_SAFE_MAX_CHAPTER_CHARS = int(
+    os.environ.get("EPUB_READER_SAFE_MAX_CHAPTER_CHARS", "12000")
+)
+
+EPUB_MODES = frozenset({"full", "reader_safe"})
+EQUATION_PLACEHOLDER = "[Equation omitted in reader-safe mode]"
+
+READER_SAFE_ALLOWED_TAGS = frozenset({
+    "html", "head", "title", "meta", "link", "body",
+    "h1", "h2", "h3", "h4", "h5", "h6", "p", "div", "span",
+    "a", "em", "strong", "b", "i", "u", "s", "small", "sub", "sup",
+    "br", "hr", "abbr", "cite", "q", "dfn", "kbd", "samp", "var",
+    "time", "mark", "ins", "del", "ul", "ol", "li", "dl", "dt", "dd",
+    "blockquote", "pre", "code",
+})
 
 # ── Content whitelist ────────────────────────────────────────────────────────
 # OCR output routinely contains stray angle-bracket sequences that markdown
@@ -80,6 +95,12 @@ ALLOWED_NS_ATTRS = {
 }
 
 IMG_REF_RE = re.compile(r"images/page_(\d+)_(\d+)\.(jpe?g|png|gif|webp)", re.I)
+MARKDOWN_IMAGE_RE = re.compile(
+    r"!\[(?P<alt>[^\]]*)\]\((?P<target><[^>]+>|[^)\s]+)"
+    r"(?:\s+(?:\"[^\"]*\"|'[^']*'))?\)",
+)
+HTML_IMAGE_RE = re.compile(r"<img\b(?P<attrs>[^>]*)>", re.I)
+HTML_ALT_RE = re.compile(r"\balt\s*=\s*(['\"])(.*?)\1", re.I | re.S)
 
 # Unlimited-OCR commonly emits lightweight TeX-like notation for equations,
 # for example ``σ_{family}`` or ``w = r = (n + 1) / 2``. EPUB readers do not
@@ -190,6 +211,54 @@ def _render_math_in_markdown(text: str) -> str:
     return "\n".join(rendered)
 
 
+def _replace_math_with_placeholders(text: str) -> str:
+    """Replace recognizable equations while preserving fenced code blocks."""
+    rendered = []
+    in_fence = False
+    for line in text.splitlines():
+        if re.match(r"^\s{0,3}```", line):
+            in_fence = not in_fence
+            rendered.append(line)
+            continue
+        if in_fence:
+            rendered.append(line)
+            continue
+
+        line = _MATH_DELIMITER_RE.sub(EQUATION_PLACEHOLDER, line)
+        line = _MATH_SUBSCRIPT_RE.sub(EQUATION_PLACEHOLDER, line)
+        line = _MATH_SUPERSCRIPT_RE.sub(EQUATION_PLACEHOLDER, line)
+        line = _MATH_COMPACT_SUBSCRIPT_RE.sub(EQUATION_PLACEHOLDER, line)
+        rendered.append(line)
+    return "\n".join(rendered)
+
+
+def _image_placeholder(alt: str) -> str:
+    alt = re.sub(r"\s+", " ", alt).strip()
+    return f"[Figure omitted: {alt}]" if alt else "[Figure omitted]"
+
+
+def _replace_images_with_placeholders(text: str) -> str:
+    """Replace Markdown/raw HTML images before Markdown can create <img> tags."""
+    def markdown_image(match):
+        return _image_placeholder(match.group("alt"))
+
+    def html_image(match):
+        alt_match = HTML_ALT_RE.search(match.group("attrs"))
+        return _image_placeholder(alt_match.group(2) if alt_match else "")
+
+    text = MARKDOWN_IMAGE_RE.sub(markdown_image, text)
+    return HTML_IMAGE_RE.sub(html_image, text)
+
+
+def _prepare_reader_safe_markdown(text: str) -> str:
+    """Keep source text while removing reader-hostile image/equation markup."""
+    text = _replace_images_with_placeholders(text)
+    text = _replace_math_with_placeholders(text)
+    # Do not enable the Markdown table extension in reader-safe mode. Removing
+    # separator rows keeps pipe tables readable as ordinary text paragraphs.
+    return re.sub(r"^\s*\|?(?:\s*:?-{2,}:?\s*\|)+\s*$", "", text, flags=re.MULTILINE)
+
+
 def _split_chapters(text: str) -> list[tuple[str, str]]:
     """
     Split markdown text into (title, content) chapters at H1/H2 headings
@@ -228,6 +297,17 @@ def _split_oversized(
             out.append((title, content))
             continue
         paragraphs = re.split(r"\n\s*\n", content)
+        expanded_paragraphs = []
+        for para in paragraphs:
+            while len(para) > max_chars:
+                cut = para.rfind(" ", 0, max_chars)
+                if cut < max_chars // 2:
+                    cut = max_chars
+                expanded_paragraphs.append(para[:cut].rstrip())
+                para = para[cut:].lstrip()
+            if para:
+                expanded_paragraphs.append(para)
+        paragraphs = expanded_paragraphs
         parts: list[str] = []
         current: list[str] = []
         current_len = 0
@@ -368,7 +448,11 @@ def _clean_attributes(el, local: str) -> int:
     return dropped
 
 
-def _sanitize_tree(root, allowed_image_srcs: frozenset | None = None) -> int:
+def _sanitize_tree(
+    root,
+    allowed_image_srcs: frozenset | None = None,
+    allowed_tags: frozenset | None = None,
+) -> int:
     """
     Enforce the content whitelist on a parsed (X)HTML tree, in place.
 
@@ -382,6 +466,7 @@ def _sanitize_tree(root, allowed_image_srcs: frozenset | None = None) -> int:
 
     Returns the number of modifications made (0 = tree was already clean).
     """
+    allowed_tags = allowed_tags or frozenset(ALLOWED_TAGS)
     changes = 0
     elements = list(root.iter())
     # Reverse document order processes children before their parents, so an
@@ -396,7 +481,11 @@ def _sanitize_tree(root, allowed_image_srcs: frozenset | None = None) -> int:
             _remove_element(el)
             changes += 1
             continue
-        if local not in ALLOWED_TAGS or ":" in local:
+        if local in {"script", "style"}:
+            _remove_element(el)
+            changes += 1
+            continue
+        if local not in allowed_tags or ":" in local:
             _unwrap_element(el)
             changes += 1
             continue
@@ -422,6 +511,7 @@ def _sanitize_html_fragment(
     body: str,
     chapter_title: str,
     allowed_image_srcs: frozenset = frozenset(),
+    reader_safe: bool = False,
 ) -> str:
     """
     Turn python-markdown output into guaranteed-valid XHTML body content.
@@ -438,7 +528,11 @@ def _sanitize_html_fragment(
     """
     try:
         fragment = lhtml.fragment_fromstring(body, create_parent="div")
-        changes = _sanitize_tree(fragment, allowed_image_srcs)
+        changes = _sanitize_tree(
+            fragment,
+            allowed_image_srcs,
+            READER_SAFE_ALLOWED_TAGS if reader_safe else None,
+        )
         parts = [html.escape(fragment.text) if fragment.text else ""]
         parts += [etree.tostring(child, encoding="unicode", method="xml")
                   for child in fragment]
@@ -814,6 +908,7 @@ def build_epub(
     cover_image_bytes: bytes | None = None,
     cover_image_mime: str = "image/jpeg",
     images: dict[str, bytes] | None = None,
+    mode: str = "full",
 ):
     """
     Assemble and write an EPUB file.
@@ -830,9 +925,20 @@ def build_epub(
         images: Package-relative path -> bytes for images the OCR markdown
             references (see extract_pdf_images_for_markdown). <img> tags
             pointing anywhere else are stripped rather than shipped broken.
+        mode: ``full`` preserves figures and rich Markdown; ``reader_safe``
+            emits a text-first EPUB with placeholders and smaller chapters.
     """
+    if mode not in EPUB_MODES:
+        raise ValueError(f"Unknown EPUB mode {mode!r}; choose 'full' or 'reader_safe'")
+
+    reader_safe = mode == "reader_safe"
     ocr_text = _fix_text_encoding(ocr_text)
-    images = images or {}
+    if reader_safe:
+        ocr_text = _prepare_reader_safe_markdown(ocr_text)
+        cover_image_bytes = None
+        images = {}
+    else:
+        images = images or {}
     allowed_image_srcs = frozenset(images)
 
     book = epub.EpubBook()
@@ -862,11 +968,13 @@ def build_epub(
             logger.warning("Building EPUB without a cover (validation failed)")
 
     # CSS
-    css = epub.EpubItem(
-        uid="style",
-        file_name="style/main.css",
-        media_type="text/css",
-        content=b"""
+    css_text = (b"""
+body { font-family: serif; line-height: 1.45; margin: 0.8em 1em; }
+h1, h2, h3 { margin-top: 1.2em; }
+p { margin: 0.45em 0; }
+pre, code { font-family: monospace; white-space: pre-wrap; overflow-wrap: break-word; }
+blockquote { margin: 0.8em 1em; }
+""" if reader_safe else b"""
 body { font-family: Georgia, serif; line-height: 1.6; margin: 1em 2em; }
 h1, h2, h3 { margin-top: 1.5em; }
 p { margin: 0.5em 0; text-indent: 1.5em; }
@@ -878,21 +986,30 @@ pre { white-space: pre-wrap; overflow-wrap: break-word; }
 code { overflow-wrap: break-word; }
 table { border-collapse: collapse; width: 100%; }
 th, td { border: 1px solid #ccc; padding: 0.4em 0.8em; overflow-wrap: break-word; }
-""",
+""")
+    css = epub.EpubItem(
+        uid="style",
+        file_name="style/main.css",
+        media_type="text/css",
+        content=css_text,
     )
     book.add_item(css)
 
     # Split into chapters
-    chapters = _split_oversized(_split_chapters(ocr_text))
+    max_chars = READER_SAFE_MAX_CHAPTER_CHARS if reader_safe else MAX_CHAPTER_CHARS
+    chapters = _split_oversized(_split_chapters(ocr_text), max_chars=max_chars)
     epub_chapters = []
 
     for idx, (chapter_title, chapter_md) in enumerate(chapters):
-        chapter_md = _render_math_in_markdown(chapter_md)
+        if not reader_safe:
+            chapter_md = _render_math_in_markdown(chapter_md)
         html_body = markdown.markdown(
             chapter_md,
-            extensions=["tables", "fenced_code"],
+            extensions=["fenced_code"] if reader_safe else ["tables", "fenced_code"],
         )
-        html_body = _sanitize_html_fragment(html_body, chapter_title, allowed_image_srcs)
+        html_body = _sanitize_html_fragment(
+            html_body, chapter_title, allowed_image_srcs, reader_safe=reader_safe
+        )
         safe_title = html.escape(chapter_title, quote=False)
         chapter = epub.EpubHtml(
             title=chapter_title,
