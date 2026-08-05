@@ -5,6 +5,7 @@ ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y \
     python3.11 python3.11-dev python3-pip \
+    default-jre-headless \
     libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
     && rm -rf /var/lib/apt/lists/*
 

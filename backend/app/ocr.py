@@ -203,6 +203,61 @@ def pdf_to_images(pdf_path: str, dpi: int = 300) -> list[str]:
     return paths
 
 
+def pdf_to_markdown(pdf_path: str) -> str:
+    """
+    Extract a usable Markdown representation from a PDF text layer.
+
+    Text-based PDFs already contain the exact Unicode glyphs used by their
+    equations. Using that layer avoids asking OCR to reconstruct subscripts,
+    operators, and symbols from a downscaled page image. The function returns
+    an empty string for scanned/image-only PDFs so callers can fall back to
+    OCR. PDF bookmarks become Markdown headings and non-background embedded
+    images become stable references that the EPUB builder can package.
+    """
+    doc = fitz.open(pdf_path)
+    try:
+        toc_by_page: dict[int, list[tuple[int, str]]] = {}
+        for level, title, page_number in doc.get_toc(simple=True):
+            if title.strip() and page_number > 0:
+                toc_by_page.setdefault(page_number - 1, []).append(
+                    (min(max(level, 1), 2), title.strip())
+                )
+
+        chunks: list[str] = []
+        nonempty_pages = 0
+        for page_index, page in enumerate(doc):
+            page_text = page.get_text("text").strip()
+            if not page_text:
+                continue
+            nonempty_pages += 1
+            parts = [f"{'#' * level} {title}" for level, title in toc_by_page.get(page_index, [])]
+            parts.append(page_text)
+
+            # Keep image references in the extracted Markdown. Skip full-page
+            # backgrounds and tiny masks; those are not reader-useful figures.
+            seen_xrefs: set[int] = set()
+            for image_index, image in enumerate(page.get_images(full=True)):
+                xref, _smask, width, height = image[:4]
+                if xref in seen_xrefs or width < 80 or height < 80:
+                    continue
+                seen_xrefs.add(xref)
+                rects = page.get_image_rects(xref)
+                if rects and any(
+                    rect.get_area() >= page.rect.get_area() * 0.8 for rect in rects
+                ):
+                    continue
+                parts.append(f"![](images/page_{page_index}_{image_index}.jpg)")
+            chunks.append("\n\n".join(parts))
+
+        # A scanned PDF may have a sparse metadata layer; do not mistake it
+        # for usable source text and silently skip OCR.
+        if nonempty_pages < max(1, int(len(doc) * 0.60)):
+            return ""
+        return "\n\n".join(chunks).strip()
+    finally:
+        doc.close()
+
+
 def render_page_thumbnail(pdf_path: str, page_index: int, max_dim: int = 300) -> bytes:
     """Render a single PDF page as a JPEG thumbnail, returned as bytes."""
     doc = fitz.open(pdf_path)
@@ -293,6 +348,7 @@ def run_ocr(image_paths: list[str], progress_callback=None) -> str:
         • Markdown code-fence wrappers (```markdown … ``` or ``` … ```)
           Some models wrap their entire output in a fenced block.
         • Common chat/instruction special tokens (<|im_end|>, </s>, <|eot|>, …)
+        • <PAGE> page-delimiter markers
         • Leading/trailing whitespace
         """
         import re as _re
@@ -314,6 +370,12 @@ def run_ocr(image_paths: list[str], progress_callback=None) -> str:
             "<|end_header_id|>", "<|finetune_right_pad_id|>",
         ):
             text = text.replace(token, "")
+
+        # Unlimited-OCR emits a literal <PAGE> marker between pages. It is
+        # not book text, and downstream markdown passes it through as raw
+        # unclosed HTML that breaks the XHTML well-formedness of every
+        # chapter it lands in.
+        text = _re.sub(r"</?PAGE\b[^>\n]*>", "", text)
 
         return text.strip()
 
